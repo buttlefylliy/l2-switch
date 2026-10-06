@@ -31,6 +31,10 @@
 MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 9223372036854775807 的
 整数），并按事件顺序单调不减。未提供 `aging_time_ms` 的场景不得出现
 `time_ms`。
+场景可选顶层布尔字段 `include_counters`：为 `true` 时汇总本次场景的计数，
+并在 `dynamic_table` 后追加 `counters`；字段缺省或为 `false` 时输出字段
+与逐字节结果均与不含该字段时一致。`include_counters` 不是布尔值时在任何
+事件处理前以 ConfigError（退出码 3，路径 `$.include_counters`）失败。
 先校验完整场景，再按事件顺序处理：
 
 * 未标记帧归入 VLAN 1；带标签帧按 `vid` 隔离，`vid` 0 也是独立域。
@@ -47,10 +51,25 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   时间仍触发到期清理，但不新建或刷新表项。刷新时间取学习/迁移事件的
   `time_ms`；不同 VLAN 的同名 MAC 独立老化。处理不按时间跨度循环推进。
 * 输出为单行固定键序 JSON：版本标识、与输入一一对应的结果
-  (event、vid、src_mac、dst_mac、decision、egress_ports) 以及最终动态表快照
+  (event、vid、src_mac、dst_mac、decision、egress_ports)、最终动态表快照
   (按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序；仅含最后事件时刻仍有效
-  的表项)。
-* 只做场景内动态表；无静态表项、端口模式、计数或跨进程持久化。
+  的表项)，以及 `include_counters` 为 `true` 时追加在 `dynamic_table` 之后的
+  `counters`。
+* `counters` 包含 `ports` 与 `vlans` 两个数组：
+  * 端口项按 name 的 Unicode 码点升序输出，每个已配置端口都出现（即使计数全
+    为零），字段依次为 name、ingress_frames、egress_frames、dropped_frames。
+  * VLAN 项按 vid 数值升序输出 vid 与相同的三个计数字段，只包含事件实际归属
+    过的 VLAN。
+  * ingress_frames 统计以该端口/VLAN 为入口的全部事件，包括随后因坏帧或端口
+    不可转发而丢弃的事件；未标记帧归入 VLAN 1，带标签帧使用其 vid（含
+    vid 0）。
+  * egress_frames 按 `egress_ports` 中的实际交付累计：泛洪到多个端口时分别
+    增加各出口端口，VLAN 出口计数为该 VLAN 的实际出口交付总数。
+  * dropped_frames 只在 decision 为 `dropped` 时计入入口端口/入口 VLAN；
+    `filtered` 不算丢弃。老化清理不产生帧计数。
+  * 计数只依赖按输入顺序得到的转发结果，不读取墙上时钟，不改变学习、迁移、
+    查表、转发决定或最终动态表。
+* 只做场景内动态表；无静态表项、端口模式或跨进程持久化。
 
 ## 退出码与错误
 
@@ -58,7 +77,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置、`aging_time_ms` 或 `include_counters` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port) |
 
