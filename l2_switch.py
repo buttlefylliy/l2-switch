@@ -515,6 +515,13 @@ def read_scenario(path):
         raise ValueError("scenario file is not valid JSON")
 
 
+def _check_include_counters(value, path):
+    # include_counters 是场景级开关，类型错误归 ConfigError。
+    if not isinstance(value, bool):
+        raise ConfigError("'include_counters' must be a boolean", path)
+    return value
+
+
 def _check_aging_time_ms(value, path):
     # aging_time_ms 是场景级配置字段，类型/范围错误归 ConfigError。
     if isinstance(value, bool) or not isinstance(value, int):
@@ -544,10 +551,11 @@ def _check_event_time_ms(value, path):
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
-    返回 (port_by_name, validated_events, aging_time_ms)：
+    返回 (port_by_name, validated_events, aging_time_ms, include_counters)：
     port_by_name 将端口 name 映射为 {"can_forward", "can_learn"}；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
-    未启用老化时 aging_time_ms 与每项 time_ms 均为 None。
+    未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
+    include_counters 缺省或为 false 时为 False，输出不含 counters。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -555,6 +563,7 @@ def validate_scenario(scenario):
     # 按顶层键在输入中出现的顺序报告首个错误；遍历后再按规范顺序报告缺失字段。
     seen_fields = set()
     aging_time_ms = None
+    include_counters = False
     for field, value in scenario.items():
         path = "$." + field
         if field == "ports":
@@ -564,6 +573,9 @@ def validate_scenario(scenario):
         elif field == "aging_time_ms":
             # 记录校验后的值；是否启用老化完全由该字段是否出现决定。
             aging_time_ms = _check_aging_time_ms(value, path)
+            seen_fields.add(field)
+        elif field == "include_counters":
+            include_counters = _check_include_counters(value, path)
             seen_fields.add(field)
         else:
             raise ConfigError("unexpected field '%s'" % field, path)
@@ -645,12 +657,14 @@ def validate_scenario(scenario):
         event_time = values["time_ms"] if aging_time_ms is not None else None
         validated_events.append((ingress, verdict, event_time))
 
-    return port_by_name, validated_events, aging_time_ms
+    return port_by_name, validated_events, aging_time_ms, include_counters
 
 
 def run_scenario(scenario):
     """校验并按顺序处理场景，返回固定键序的结果对象。"""
-    port_by_name, events, aging_time_ms = validate_scenario(scenario)
+    port_by_name, events, aging_time_ms, include_counters = validate_scenario(
+        scenario
+    )
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -658,6 +672,16 @@ def run_scenario(scenario):
         for name, attrs in port_by_name.items()
         if attrs["can_forward"]
     )
+
+    # 计数状态仅在 include_counters 为真时维护；只读取转发结果，
+    # 不参与学习、迁移、查表或转发决定。
+    # 端口计数覆盖全部已配置端口 (按 name 码点升序)，VLAN 计数只含事件实际归属的 VLAN。
+    if include_counters:
+        port_stats = {name: [0, 0, 0] for name in sorted(port_by_name)}
+        vlan_stats = {}
+    else:
+        port_stats = None
+        vlan_stats = None
 
     # 动态表：键为 (vid, 小写单播源 MAC)；
     # 启用老化时值为 (学习到的端口 name, 最后刷新时间)，未启用时刷新时间为 None。
@@ -723,6 +747,23 @@ def run_scenario(scenario):
             }
         )
 
+        if include_counters:
+            # 入口计数覆盖全部事件 (含随后丢弃的)；丢弃只计 decision 为
+            # dropped 的事件 (filtered 不算)；出口按实际交付逐端口累计。
+            port_entry = port_stats[ingress]
+            port_entry[0] += 1
+            vlan_entry = vlan_stats.get(vid)
+            if vlan_entry is None:
+                vlan_entry = vlan_stats[vid] = [0, 0, 0]
+            vlan_entry[0] += 1
+            if decision == "dropped":
+                port_entry[2] += 1
+                vlan_entry[2] += 1
+            for name in egress:
+                port_stats[name][1] += 1
+            # VLAN 出口计数为该 VLAN 实际出口交付的总数。
+            vlan_entry[1] += len(egress)
+
     # 表项按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序排列。
     # 最后事件时刻仍有效的表项才会出现在快照中，字段与键序保持不变。
     entries = [
@@ -730,11 +771,37 @@ def run_scenario(scenario):
         for (vid, mac), (port, _) in sorted(table.items(), key=lambda kv: kv[0])
     ]
 
-    return {
+    output = {
         "schema": FORWARD_SCHEMA,
         "results": results,
         "dynamic_table": entries,
     }
+
+    if include_counters:
+        # 端口项按 name 的 Unicode 码点升序 (port_stats 已按此序构建)，
+        # 每个已配置端口都出现；VLAN 项按 vid 数值升序，只含事件归属过的 VLAN。
+        output["counters"] = {
+            "ports": [
+                {
+                    "name": name,
+                    "ingress_frames": stats[0],
+                    "egress_frames": stats[1],
+                    "dropped_frames": stats[2],
+                }
+                for name, stats in port_stats.items()
+            ],
+            "vlans": [
+                {
+                    "vid": vid,
+                    "ingress_frames": stats[0],
+                    "egress_frames": stats[1],
+                    "dropped_frames": stats[2],
+                }
+                for vid, stats in sorted(vlan_stats.items())
+            ],
+        }
+
+    return output
 
 
 def cmd_forward(args):
@@ -832,7 +899,8 @@ def build_parser():
             "并向标准输出写入单行 JSON 结果。"
             "未标记帧归入 VLAN 1，带标签帧按 vid 隔离，vid 0 也作为独立域。"
             "场景可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
-            "不含静态表项、端口模式、计数或跨进程持久化。"
+            "可选 include_counters 为 true 时在 dynamic_table 后追加本次场景的"
+            "端口与 VLAN 帧计数；不含静态表项、端口模式或跨进程持久化。"
         ),
         epilog=(
             "限制: 端口数量上限为 %d；事件数量上限为 %d。"
@@ -854,8 +922,8 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
-            "可选 aging_time_ms；每个事件包含 ingress_port 与完整 frame 描述，"
-            "启用老化时每个事件还需包含 time_ms"
+            "可选 aging_time_ms 与 include_counters；每个事件包含 ingress_port "
+            "与完整 frame 描述，启用老化时每个事件还需包含 time_ms"
         ),
     )
     forward_parser.set_defaults(func=cmd_forward)
