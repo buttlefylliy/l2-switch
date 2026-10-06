@@ -27,7 +27,8 @@ FORWARD_SCHEMA = "l2-switch/forward-v1"
 UNTAGGED_VID = 1
 
 # 每个端口允许的字段及其规范顺序；额外字段一律拒绝。
-# access_vid 为可选的接入 VLAN 归属，缺省时不出现在快照中。
+# access_vid 为可选的接入 VLAN 归属，trunk_vids 为可选的中继 VLAN 允许数组，
+# 二者互斥，缺省时都不出现在快照中。
 FIELD_ORDER = (
     "name",
     "kind",
@@ -37,12 +38,16 @@ FIELD_ORDER = (
     "speed_mbps",
     "duplex",
     "access_vid",
+    "trunk_vids",
 )
 FIELD_SET = frozenset(FIELD_ORDER)
-OPTIONAL_FIELDS = frozenset(("access_vid",))
+OPTIONAL_FIELDS = frozenset(("access_vid", "trunk_vids"))
 
 MIN_ACCESS_VID = 1
 MAX_ACCESS_VID = 4094
+
+MIN_TRUNK_VID = 1
+MAX_TRUNK_VID = 4094
 
 ADMIN_STATES = frozenset(("up", "down"))
 FORWARDING_STATES = frozenset(("forwarding", "blocking"))
@@ -194,6 +199,34 @@ def _check_access_vid(value, path):
     return value
 
 
+def _check_trunk_vids(value, path):
+    # 非空整数数组声明中继端口允许承载的 802.1Q VLAN；快照按数值升序规范化。
+    if not isinstance(value, list):
+        raise ConfigError("'trunk_vids' must be an array", path)
+    if len(value) == 0:
+        raise ConfigError("'trunk_vids' must be a non-empty array", path)
+    seen = set()
+    for index, item in enumerate(value):
+        item_path = "%s[%d]" % (path, index)
+        # bool 是 int 的子类型，必须显式排除。
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(
+                "'trunk_vids' elements must be integers", item_path
+            )
+        if item < MIN_TRUNK_VID or item > MAX_TRUNK_VID:
+            raise ConfigError(
+                "'trunk_vids' elements must be between %d and %d"
+                % (MIN_TRUNK_VID, MAX_TRUNK_VID),
+                item_path,
+            )
+        if item in seen:
+            raise ConfigError(
+                "'trunk_vids' must not contain duplicate values", item_path
+            )
+        seen.add(item)
+    return sorted(value)
+
+
 FIELD_CHECKS = {
     "name": _check_name,
     "kind": _check_kind,
@@ -203,6 +236,7 @@ FIELD_CHECKS = {
     "speed_mbps": _check_speed_mbps,
     "duplex": _check_duplex,
     "access_vid": _check_access_vid,
+    "trunk_vids": _check_trunk_vids,
 }
 
 
@@ -210,8 +244,8 @@ def validate_port(item, index, seen):
     """校验单个端口，按输入字段顺序返回 (有序字段, can_forward, can_learn)。
 
     按字段在输入中出现的顺序报告首个错误 (未知字段、非法值或重复 name 立即
-    报告)；仅当所有出现字段均合法后，才按规范字段顺序报告首个缺失字段
-    (可选字段 access_vid 不参与缺失检查)。
+    报告)；仅当所有出现字段均合法后，才检查 access_vid 与 trunk_vids 互斥，
+    再按规范字段顺序报告首个缺失字段 (可选字段不参与缺失检查)。
     """
     base = "$.ports[%d]" % index
 
@@ -231,6 +265,12 @@ def validate_port(item, index, seen):
                 )
             seen.add(checked)
         values[field] = checked
+
+    if "access_vid" in values and "trunk_vids" in values:
+        raise ConfigError(
+            "'trunk_vids' and 'access_vid' are mutually exclusive",
+            base + ".trunk_vids",
+        )
 
     for field in FIELD_ORDER:
         if field not in values and field not in OPTIONAL_FIELDS:
@@ -664,7 +704,7 @@ def validate_scenario(scenario):
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
     static_map)：port_by_name 将端口 name 映射为 {"can_forward", "can_learn",
-    "access_vid"} (未配置 access_vid 时为 None)；
+    "access_vid", "trunk_vids"} (未配置对应 VLAN 模式时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
     include_counters 缺省或为 false 时为 False，输出不含 counters；
@@ -729,6 +769,9 @@ def validate_scenario(scenario):
             "can_learn": can_learn,
             # 未配置 access_vid 时为 None，表示不参与接入口 VLAN 限制。
             "access_vid": fields.get("access_vid"),
+            # 未配置 trunk_vids 时为 None，表示不参与中继 VLAN 限制；
+            # 配置时为按数值升序规范化后的允许 VID 数组。
+            "trunk_vids": fields.get("trunk_vids"),
         }
 
     # 静态表在 ports 之后、events 之前校验；端口引用检查依赖 port_by_name。
@@ -816,10 +859,15 @@ def run_scenario(scenario):
     results = []
 
     def vlan_allows(port_name, vid):
-        # 接入口只承载与其 access_vid 相同的内部 VLAN；未配置 access_vid
-        # 的端口不受接入 VLAN 限制，按既有语义参与转发。
-        access_vid = port_by_name[port_name]["access_vid"]
-        return access_vid is None or access_vid == vid
+        # 接入口只承载与其 access_vid 相同的内部 VLAN；中继端口只承载
+        # trunk_vids 允许的内部 VLAN；两种 VLAN 模式都未配置的端口不受
+        # 接入/中继 VLAN 限制，按既有语义参与转发。
+        attrs = port_by_name[port_name]
+        access_vid = attrs["access_vid"]
+        if access_vid is not None:
+            return access_vid == vid
+        trunk_vids = attrs["trunk_vids"]
+        return trunk_vids is None or vid in trunk_vids
 
     for index, (ingress, verdict, time_ms) in enumerate(events):
         # 老化由显式事件时钟驱动：在处理该帧之前，一次性删除所有
@@ -837,6 +885,7 @@ def run_scenario(scenario):
 
         ingress_attrs = port_by_name[ingress]
         access_vid = ingress_attrs["access_vid"]
+        trunk_vids = ingress_attrs["trunk_vids"]
         tagged = verdict["vlan"] is not None
         if tagged:
             # 带标签帧的内部 VLAN 取其标签 VID；在接入口上这也是违例事件的
@@ -846,6 +895,7 @@ def run_scenario(scenario):
             # 接入口上的未标记帧 (含坏帧) 归入其接入 VLAN。
             vid = access_vid
         else:
+            # 中继端口与其他端口上的未标记帧 (含坏帧) 归入缺省 VLAN 1。
             vid = UNTAGGED_VID
         src_mac = verdict["src_mac"]
         dst_mac = verdict["dst_mac"]
@@ -855,10 +905,16 @@ def run_scenario(scenario):
         # 入端口不能转发：该事件确定为 dropped。
         # 接入口收到任何带 802.1Q 标签的帧 (含 VID 0 或与 access_vid 相同)：
         # 接入策略违例，dropped，不学习、不查表、无出口。
+        # 中继端口收到未标记帧，或标签 VID 为 0 或不在 trunk_vids 允许数组中：
+        # 中继策略违例，dropped，不学习、不查表、无出口。
         if (
             not verdict["valid"]
             or not ingress_attrs["can_forward"]
             or (tagged and access_vid is not None)
+            or (
+                trunk_vids is not None
+                and (not tagged or vid not in trunk_vids)
+            )
         ):
             decision = "dropped"
         else:
@@ -1086,6 +1142,10 @@ def build_parser():
             "端口可选 access_vid (1..4094) 声明接入 VLAN：该端口上的未标记帧"
             "归入接入 VLAN，任何带标签帧均作为接入策略违例丢弃；"
             "只有内部 VLAN 与 access_vid 相同的接入口才能成为出口。"
+            "端口可选 trunk_vids (1..4094 的非空不重复整数数组，与 access_vid"
+            " 互斥) 声明中继允许承载的 VLAN：该端口只接收 VID 在允许数组中的"
+            "带标签帧，未标记帧与 VID 0 或不允许的标签帧作为中继策略违例丢弃；"
+            "只有内部 VLAN 被允许的中继端口才能成为出口。"
             "场景可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
             "可选 static_table 声明始终有效、不参与老化且不被学习覆盖的静态表项，"
             "单播目的查找优先匹配静态项；"
