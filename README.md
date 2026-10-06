@@ -151,6 +151,28 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     空事件或没有变化时为空数组；记录总数不超过事件数的两倍。
   * 该审计开关不改变学习、转发、计数或最终表状态；相同场景的记录内容、
     顺序与整行 JSON 逐字节一致。
+* 场景可选顶层 `ingress_mirror` 对象声明唯一一个入口镜像会话，仅含
+  `source_ports` 与 `destination_port` 两个字段：`source_ports` 为已配置
+  端口名组成的非空、不重复数组（长度不超过已配置端口总数），
+  `destination_port` 为另一个已配置端口且不得出现在 `source_ports` 中。
+  结构错误、字段缺失或多余、`source_ports` 为空或超过端口总数、元素非
+  字符串或重复，以及目的端口同时属于源端口时，均在处理任何事件前以
+  ConfigError（退出码 3，路径 `$.ingress_mirror` 或其子路径）失败；
+  源或目的名称未引用现有端口时以 StateError（退出码 5）失败，标准输出
+  不写入部分结果。
+  * 完整场景校验成功后，凡 `ingress_port` 属于 `source_ports` 的事件都
+    独立尝试向镜像目的端口交付一份原始入口帧副本；即使原帧因 runt、
+    oversize、bad_fcs、入口端口状态、VLAN 策略或端口安全而被丢弃，也仍
+    尝试镜像。仅当目的端口的 `can_forward` 为真时交付；目的端口的
+    `access_vid` 或 `trunk_vids` 不限制这份原始入口副本。每个事件最多
+    产生一个镜像副本。
+  * 镜像不触发额外学习、刷新、迁移或老化，不改变 `decision`、
+    `egress_ports`、动态转发表、`fdb_events` 与 VLAN 计数；
+    `include_counters` 的 `egress_frames` 只统计普通转发，不统计镜像副本。
+  * 提供 `ingress_mirror` 时，每条 results 记录在 `egress_ports` 后追加
+    `mirror_ports`：成功交付时为仅含 `destination_port` 的数组，否则为
+    空数组。省略 `ingress_mirror` 时，既有校验、输出键序与逐字节结果
+    保持不变。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -159,9 +181,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port 或静态项 port) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port 或镜像源/目的端口) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
