@@ -24,6 +24,15 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 `can_forward`/`can_learn`。类型或范围错误以 ConfigError（退出码 3，
 路径 `$.ports[i].access_vid`）失败。
 
+每个端口可选 `trunk_vids` 字段（1 到 4094 的整数组成的非空数组，布尔值
+不算整数，数组内不得重复）声明中继端口允许通过的 802.1Q VLAN；
+`trunk_vids` 与 `access_vid` 互斥，二者都省略时保持不受接入口/中继
+限制的兼容语义。提供时快照中该键位于 `access_vid` 之后（`access_vid`
+不存在时位于 `duplex` 之后），VID 规范化为数值升序；省略时不补默认键。
+不是数组、为空、元素为布尔值或非整数、超出范围、重复，或与 `access_vid`
+同时出现时，以 ConfigError（退出码 3，路径 `$.ports[i].trunk_vids` 或
+对应元素路径）失败。
+
 ### `frame`
 
 读取 UTF-8 JSON 单帧描述，做离线合法性判定 (runt/oversize/bad_fcs 等)，
@@ -51,6 +60,13 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   已剥除，`egress_ports` 仍只返回端口名。未配置 `access_vid` 的端口遵循
   既有语义，可与接入口共存；从这类端口进入的帧只有内部 VLAN 匹配时才能
   发往接入口。
+* 配置了 `trunk_vids` 的端口为中继口：只接收带标签且 VID 在允许数组中的
+  帧；未标记帧仍按缺省 VLAN 1 生成结果 vid 与 VLAN 计数，但作为中继策略
+  违例 `dropped`；VID 0 或不在允许数组中的标签帧同样 `dropped`。这些事件
+  不学习源 MAC、不查询转发表且无出口。合法标签帧按其 VID 学习、老化、
+  查表与计数。中继口仅在内部 VLAN 位于其允许数组时才能成为泛洪或单播
+  出口；动态或静态单播命中一个不允许该 VLAN 的中继口时结果为 `dropped`，
+  不退回泛洪。接入口与未声明两种 VLAN 模式的端口行为不变。
 * 仅合法、未被丢弃且入端口 `can_learn` 为真的帧，按 (VLAN, 规范化小写单播源 MAC)
   学习；同一键从另一端口出现时迁移到新端口。
 * 广播、组播与未命中单播泛洪到除入端口外所有 `can_forward` 为真的端口
@@ -76,7 +92,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     dropped_frames。ingress_frames 统计以该端口为入口的全部事件 (含随后因
     坏帧或端口不可转发而丢弃的)；egress_frames 按 egress_ports 中的实际交付
     逐端口累计 (泛洪到多个端口时分别计数)；dropped_frames 只在 decision 为
-    dropped 时计入入口端口 (filtered 不算丢弃)。
+    dropped 时计入入口端口 (filtered 不算丢弃；接入/中继策略违例算丢弃)。
   * `counters.vlans` 按 vid 数值升序，只包含事件实际归属过的 VLAN
     (未标记帧归入 VLAN 1，带标签帧使用其 vid，含 vid 0)，字段为 vid 与相同
     的三个计数字段；egress_frames 为该 VLAN 实际出口交付的总数。
