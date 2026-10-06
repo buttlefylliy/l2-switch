@@ -19,6 +19,7 @@ MAX_FRAME_FILE_BYTES = 131072
 MAX_PAYLOAD_BYTES = 65535
 MAX_EVENTS = 10000
 MAX_STATIC_ENTRIES = 10000
+MAX_MAC_BINDINGS = 10000
 MAX_ACL_RULES = 4096
 
 SCHEMA = "l2-switch/ports-v1"
@@ -727,6 +728,62 @@ def validate_static_table(static_table, port_by_name):
     return static_map
 
 
+# VLAN 感知源 MAC 静态绑定的字段及其规范顺序；额外字段一律拒绝。
+# 绑定只校验帧的源地址，不参与目的地址查表，并可与 static_table 同键共存。
+BINDING_FIELD_ORDER = ("vid", "mac", "port")
+BINDING_FIELD_SET = frozenset(BINDING_FIELD_ORDER)
+BINDING_FIELD_CHECKS = {
+    "vid": _check_static_vid,
+    "mac": _check_static_mac,
+    "port": _check_static_port,
+}
+
+
+def validate_mac_bindings(mac_bindings, port_by_name):
+    """校验源 MAC 静态绑定表，返回键为 (vid, 小写 mac)、值为端口 name 的映射。
+
+    与静态表相同的逐项校验顺序：先按输入字段顺序检查未知字段与非法值
+    (vid/mac 复用静态表的 ConfigError 校验)，再按规范顺序报告缺失字段，
+    然后检查 (vid, mac) 组合重复，最后检查 port 引用 (未知端口归 StateError)。
+    """
+    if not isinstance(mac_bindings, list):
+        raise ConfigError("'mac_bindings' must be an array", "$.mac_bindings")
+    if len(mac_bindings) > MAX_MAC_BINDINGS:
+        raise ConfigError(
+            "number of mac bindings exceeds maximum of %d" % MAX_MAC_BINDINGS,
+            "$.mac_bindings",
+        )
+
+    binding_map = {}
+    for index, item in enumerate(mac_bindings):
+        base = "$.mac_bindings[%d]" % index
+        if not isinstance(item, dict):
+            raise ConfigError("mac binding entry must be an object", base)
+
+        values = {}
+        for field, value in item.items():
+            path = base + "." + field
+            if field not in BINDING_FIELD_SET:
+                raise ConfigError("unexpected field '%s'" % field, path)
+            values[field] = BINDING_FIELD_CHECKS[field](value, path)
+
+        for field in BINDING_FIELD_ORDER:
+            if field not in values:
+                raise ConfigError("missing field '%s'" % field, base + "." + field)
+
+        key = (values["vid"], values["mac"])
+        if key in binding_map:
+            raise ConfigError(
+                "duplicate mac binding for vid %d and mac '%s'" % key, base
+            )
+        port = values["port"]
+        if port not in port_by_name:
+            raise StateError("unknown port '%s'" % port, base + ".port")
+        binding_map[key] = port
+
+    return binding_map
+
+
 # 镜像会话 (入口/出口) 的字段及其规范顺序；额外字段一律拒绝。
 MIRROR_FIELD_ORDER = ("source_ports", "destination_port")
 MIRROR_FIELD_SET = frozenset(MIRROR_FIELD_ORDER)
@@ -1033,7 +1090,9 @@ def validate_scenario(scenario):
     egress_mirror_sources/egress_mirror_destination 对 egress_mirror 同义，
     未提供 egress_mirror 时二者均为 None；
     acl_rules 为按输入顺序排列的已校验入口 ACL 规则列表，
-    未提供 ingress_acl 时为 None。
+    未提供 ingress_acl 时为 None；
+    binding_map 键为 (vid, 小写 mac)、值为绑定端口 name，仅校验源地址，
+    未提供 mac_bindings 或其为空数组时为空映射。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -1070,6 +1129,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "ingress_acl":
             # 记录字段出现；结构校验在 ports 校验完成后进行。
+            seen_fields.add(field)
+        elif field == "mac_bindings":
+            # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
             seen_fields.add(field)
         else:
             raise ConfigError("unexpected field '%s'" % field, path)
@@ -1141,6 +1203,11 @@ def validate_scenario(scenario):
     if "ingress_acl" in seen_fields:
         acl_rules = validate_ingress_acl(scenario["ingress_acl"])
 
+    # 源 MAC 静态绑定引用端口，同样在 ports 之后、events 之前校验。
+    binding_map = {}
+    if "mac_bindings" in seen_fields:
+        binding_map = validate_mac_bindings(scenario["mac_bindings"], port_by_name)
+
     validated_events = []
     last_time_ms = None
     for index, item in enumerate(events):
@@ -1199,6 +1266,7 @@ def validate_scenario(scenario):
         egress_mirror_sources,
         egress_mirror_destination,
         acl_rules,
+        binding_map,
     )
 
 
@@ -1216,10 +1284,14 @@ def run_scenario(scenario):
         egress_mirror_sources,
         egress_mirror_destination,
         acl_rules,
+        binding_map,
     ) = validate_scenario(scenario)
     mirror_enabled = mirror_sources is not None
     egress_mirror_enabled = egress_mirror_sources is not None
     acl_enabled = acl_rules is not None
+    # 绑定只校验源地址；省略或空数组时 binding_map 为空，功能完全关闭
+    # (包括结果记录中的 binding_violation 键)。
+    bindings_enabled = bool(binding_map)
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -1327,10 +1399,23 @@ def run_scenario(scenario):
             )
         )
 
+        # 源 MAC 静态绑定在入口 ACL、端口安全、MAC 学习与目的查表前查询一次：
+        # 仅对已通过帧合法性、入端口状态与 VLAN 入站策略的事件，按内部 VLAN
+        # 与规范化源 MAC 查询；未绑定或源地址来自绑定端口时继续既有流程。
+        # 绑定不创建转发表项，也不占动态学习额度。
+        binding_violation = False
+        if bindings_enabled and pre_acl_ok:
+            bound_port = binding_map.get((vid, src_mac))
+            if bound_port is not None and bound_port != ingress:
+                # 冒用：固定 dropped、空出口；不求值 ACL，不学习、刷新或迁移
+                # 源 MAC，也不查询目的地址。事件时钟触发的老化已在上方先执行。
+                binding_violation = True
+
         # 入口 ACL 仅对已通过帧合法性、入端口转发状态与 VLAN 入站策略检查的
         # 事件求值，并在 MAC 学习、端口安全检查与目的查表之前执行；首条命中
         # 规则决定动作，均未命中时允许。vid 匹配内部 VLAN (接入口未标记帧用
         # access_vid，其他未标记帧用 VLAN 1)；pcp 只匹配带标签帧。
+        # 绑定冒用事件不求值 ACL，matched_acl_rule 保持 null。
         matched_acl_rule = None
         acl_drop = False
         original_pcp = verdict["vlan"]["pcp"] if tagged else None
@@ -1338,7 +1423,7 @@ def run_scenario(scenario):
         # 为原始 PCP；首条命中 remark_pcp 时在学习与目的查表前重标记为
         # set_pcp (内部 VLAN 不变，也不重新执行 ACL)。未标记帧始终为 None。
         effective_pcp = original_pcp
-        if acl_enabled and pre_acl_ok:
+        if acl_enabled and pre_acl_ok and not binding_violation:
             for rule_index, rule in enumerate(acl_rules):
                 if acl_rule_matches(
                     rule, src_mac, dst_mac, vid,
@@ -1359,7 +1444,7 @@ def run_scenario(scenario):
                     # 镜像副本使用新 PCP，入口镜像仍复制重标记前的原始帧。
                     effective_pcp = matched_rule["set_pcp"]
 
-        if not pre_acl_ok or acl_drop:
+        if not pre_acl_ok or acl_drop or binding_violation:
             decision = "dropped"
         else:
             # 仅在入端口 can_learn 且该 (VLAN, 规范化源 MAC) 无静态项时才
@@ -1519,6 +1604,10 @@ def run_scenario(scenario):
             # (命中 remark_pcp 时为重标记值，否则为原始 PCP，丢弃路径也有
             # 确定值)；未标记帧为 null。
             result_record["effective_pcp"] = effective_pcp
+        if bindings_enabled:
+            # binding_violation 位于所有既有可选字段之后，仅源 MAC 冒用为 true；
+            # 绑定表为空或省略时不增加该键。
+            result_record["binding_violation"] = binding_violation
         results.append(result_record)
 
         if include_counters:
@@ -1722,12 +1811,21 @@ def build_parser():
             "与 allow 一致，结果在所有既有字段后追加 matched_acl_rule 与 "
             "effective_pcp (首条命中规则的零基索引或 null；带标签帧的最终 PCP，"
             "未标记帧为 null)；"
+            "可选 mac_bindings 声明最多 %d 条 VLAN 感知的源 MAC 静态绑定 "
+            "(每项仅含 vid、mac、port，同一 (vid, 规范化 mac) 不得重复，可与 "
+            "static_table 同键共存)：绑定只校验源地址，对已通过帧合法性、入端口"
+            "状态与 VLAN 入站策略的事件，在入口 ACL、端口安全、MAC 学习与目的"
+            "查表前按内部 VLAN 与规范化源 MAC 查询；源地址从绑定端口以外的端口"
+            "出现时该事件固定 dropped、空出口，不求值 ACL、不学习刷新迁移、不查"
+            "目的表，结果在所有既有可选字段后追加 binding_violation (仅冒用为 "
+            "true)；绑定不创建转发表项也不占动态学习额度，省略或为空数组时行为"
+            "与输出逐字节不变；"
             "无端口模式或跨进程持久化。"
-            % MAX_ACL_RULES
+            % (MAX_ACL_RULES, MAX_MAC_BINDINGS)
         ),
         epilog=(
             "限制: 端口数量上限为 %d；事件数量上限为 %d；静态表项数量上限为 %d；"
-            "入口 ACL 规则数量上限为 %d。"
+            "源 MAC 绑定数量上限为 %d；入口 ACL 规则数量上限为 %d。"
             "aging_time_ms 与 time_ms 取值为 1..%d / 0..%d 的整数，"
             "time_ms 按事件顺序单调不减；不读墙上时钟。"
             "泛洪出口按端口 name 的 Unicode 码点升序排列；"
@@ -1736,6 +1834,7 @@ def build_parser():
                 MAX_PORTS,
                 MAX_EVENTS,
                 MAX_STATIC_ENTRIES,
+                MAX_MAC_BINDINGS,
                 MAX_ACL_RULES,
                 MAX_AGING_TIME_MS,
                 MAX_EVENT_TIME_MS,
@@ -1748,7 +1847,7 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
-            "可选 aging_time_ms、static_table、include_counters、"
+            "可选 aging_time_ms、static_table、mac_bindings、include_counters、"
             "include_fdb_events、ingress_mirror、egress_mirror 与 "
             "ingress_acl；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化时每个事件还需包含 time_ms"

@@ -242,6 +242,35 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     `null`。ACL 丢弃计入既有端口和 VLAN 入站及丢弃计数，入口镜像仍复制原始帧
     （重标记前），出口镜像不交付。省略 `ingress_acl` 时输出与此前逐字节
     一致；仅使用原有 `allow`、`drop` 规则时转发决定、学习结果和审计内容不变。
+* 场景可选顶层 `mac_bindings` 数组（非空时最多 10000 项）声明 VLAN 感知的源
+  MAC 静态绑定，阻止受保护地址从错误端口冒用；每项仅含 `vid`、`mac`、
+  `port`：`vid` 为 0 到 4094 的整数，`mac` 为非零单播 MAC 地址（规范化为
+  小写），`port` 引用 `ports` 中的已配置物理端口；同一 (vid, 规范化 mac)
+  组合只能出现一次。字段缺失、额外字段、`vid` 或 `mac` 类型/取值非法、组合
+  重复或数量超限均为 ConfigError（退出码 3，路径 `$.mac_bindings...`）；
+  `port` 不是字符串时同样为 ConfigError（路径 `$.mac_bindings[i].port`），
+  `port` 名称未引用现有端口时为 StateError（退出码 5，路径
+  `$.mac_bindings[i].port`）。空数组等价于省略：省略或为空时现有行为与逐字节
+  输出完全不变，不增加任何结果键。
+  * 绑定只校验帧的源地址，不参与目的地址查表；绑定可与 `static_table` 同
+    (vid, mac) 键共存，二者互不影响。绑定从场景开始到结束始终有效，不创建
+    任何转发表项，不参与老化，也不占用 `dynamic_mac_limit` 的动态学习额度。
+  * 仅对已经通过帧合法性、入端口转发状态与 VLAN 入站策略检查的事件，在入口
+    ACL 求值、`dynamic_mac_limit` 端口安全检查、MAC 学习（含刷新与迁移）和
+    目的地址查表之前，按内部 VLAN 与规范化源 MAC 查询绑定，每个事件最多查询
+    一次：接入口未标记帧使用 `access_vid`，其他未标记帧使用 VLAN 1，带标签
+    帧使用其 vid。未绑定的源地址、或源地址来自其绑定端口的事件继续既有流程。
+  * 若绑定端口与 `ingress_port` 不同（冒用），本事件固定返回 `dropped` 和空
+    `egress_ports`：不求值入口 ACL（`matched_acl_rule` 为 `null`、
+    `effective_pcp` 为原始值），不学习、刷新或迁移源 MAC，也不查询目的地址，
+    不产生 `learned`、`refreshed` 或 `moved` 记录。显式事件时钟触发的老化仍
+    先执行，并可产生 `aged` 记录。该丢弃沿用既有口径计入入口端口和 VLAN 的
+    入站及丢弃计数；入口镜像仍复制原始帧，出口镜像不交付。
+  * `mac_bindings` 非空时，每条 results 记录在现有可选字段
+    （`mirror_ports`、`egress_mirror_ports`、`matched_acl_rule`、
+    `effective_pcp`）之后追加 `binding_violation` 布尔值，仅冒用事件为
+    `true`，其余事件（含坏帧与策略拒绝事件）均为 `false`；数组为空或省略时
+    不增加该键。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -250,9 +279,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror`、`ingress_acl` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port，或镜像源/目的端口) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port，或镜像源/目的端口) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
@@ -260,7 +289,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 ## 上限
 
 * 端口数量：4096；单个端口 name 长度：64 个字符。
-* `forward` 场景事件数量：10000；静态表项数量：10000；入口 ACL 规则数量：4096。
+* `forward` 场景事件数量：10000；静态表项数量：10000；源 MAC 绑定数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 
 ## 状态
