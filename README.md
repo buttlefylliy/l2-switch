@@ -33,6 +33,13 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 超出范围、重复，或与 `access_vid` 同时出现时，以 ConfigError（退出码 3，
 路径 `$.ports[i].trunk_vids` 或对应元素路径）失败。
 
+每个端口可选 `dynamic_mac_limit` 字段（1 到 10000 的整数，布尔值不算
+整数）声明该端口的动态 MAC 学习数量上限（最基本的端口安全）；省略时
+保持无限制语义。提供时快照中该字段位于 VLAN 模式字段之后、`can_forward`
+之前，省略时不补默认键；它不改变 `can_forward`/`can_learn` 的推导。
+类型或范围错误以 ConfigError（退出码 3，路径
+`$.ports[i].dynamic_mac_limit`）失败。
+
 ### `frame`
 
 读取 UTF-8 JSON 单帧描述，做离线合法性判定 (runt/oversize/bad_fcs 等)，
@@ -113,6 +120,17 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   快照（仅含 vid、mac、port，按 vid 数值升序、再按 mac 的 Unicode 码点
   升序）；`include_counters` 为真时 `counters` 位于其后。空数组等价于
   省略，省略时输出键、顺序与逐字节内容和此前一致。
+* 配置了 `dynamic_mac_limit` 的端口启用端口安全：上限按当前绑定到该入端口
+  的动态表项总数计算（不区分 VLAN，静态表项不占额度）。只有原本满足学习
+  条件的合法帧才触发检查——源键已有静态项、入端口禁止学习、帧或 VLAN
+  策略已拒绝时不产生端口安全违例。已在同一端口的动态源照常刷新，不新增
+  额度；从其他端口迁入或首次学习的源需要一个新额度。检查发生在该事件
+  时刻的老化清理之后，刚到期的表项立即释放额度。若仍已满，本事件结果
+  固定为 `dropped` 且 `egress_ports` 为空，不做目的查表，不新增、刷新或
+  迁移任何动态项（迁移失败时旧端口上的原表项保持原状）；启用
+  `include_counters` 时该事件计入入口端口与所属 VLAN 的 ingress_frames
+  与 dropped_frames，不增加 egress_frames。若有空余，则继续沿用既有
+  学习、迁移、查表和转发规则。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
