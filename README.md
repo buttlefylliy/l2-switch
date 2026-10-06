@@ -64,7 +64,22 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     (未标记帧归入 VLAN 1，带标签帧使用其 vid，含 vid 0)，字段为 vid 与相同
     的三个计数字段；egress_frames 为该 VLAN 实际出口交付的总数。
   * 老化清理不产生帧计数；统计不改变学习、迁移、查表、转发决定或最终动态表。
-* 只做场景内动态表；无静态表项、端口模式或跨进程持久化。
+* 场景可选顶层 `static_table` 数组（最多 10000 项）声明静态 MAC 转发表；
+  每项仅含 `vid`、`mac`、`port`：`vid` 为 0 到 4094 的整数，`mac` 为非零
+  单播 MAC 地址（规范化为小写），`port` 引用 `ports` 中的端口名；同一
+  (vid, 规范化 mac) 组合只能出现一次。字段缺失、额外字段、类型或取值错误
+  以及重复组合均为 ConfigError；`port` 引用不存在的端口为 StateError。
+* 静态项从场景开始到结束始终有效：不参与 `aging_time_ms` 老化，不被源 MAC
+  学习、刷新或迁移覆盖；源 MAC 在某 VLAN 已有静态项时，该键不再创建或更新
+  动态项（帧合法性、目的查表与计数仍按既有规则处理）。合法帧的单播目的
+  查找优先匹配静态项：命中其他可转发端口时仅向该端口转发；命中入端口时
+  `filtered` 且无出口；目标端口 down 或 blocking 时 `dropped` 且无出口，
+  不退回未知单播泛洪。广播、组播与未命中单播的泛洪不受影响。
+* 提供非空 `static_table` 时，输出在 `dynamic_table` 后追加 `static_table`
+  快照（仅含 vid、mac、port，按 vid 数值升序、再按 mac 的 Unicode 码点
+  升序）；`include_counters` 为真时 `counters` 位于其后。空数组等价于
+  省略，省略时输出键、顺序与逐字节内容和此前一致。
+* 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
 
@@ -72,9 +87,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`static_table` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port 或静态项 port) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
@@ -82,7 +97,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 ## 上限
 
 * 端口数量：4096；单个端口 name 长度：64 个字符。
-* `forward` 场景事件数量：10000。
+* `forward` 场景事件数量：10000；静态表项数量：10000。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 
 ## 状态
