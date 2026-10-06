@@ -17,6 +17,12 @@
 ### `ports`
 
 读取 UTF-8 JSON 配置，校验物理端口，向标准输出写入单行确定性快照。
+每个端口可选 `access_vid`（1 到 4094 的整数，布尔值不算整数）声明接入
+VLAN 归属；提供时快照中它位于 `duplex` 之后、`can_forward` 之前，省略时
+不补默认键，既有快照字节内容不变。`access_vid` 只定义 VLAN 归属，不改变
+由管理状态、转发状态和 learning 推导出的 `can_forward`/`can_learn`。
+类型或范围错误以 ConfigError（退出码 3，路径 `$.ports[i].access_vid`）
+失败。
 
 ### `frame`
 
@@ -34,6 +40,20 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 先校验完整场景，再按事件顺序处理：
 
 * 未标记帧归入 VLAN 1；带标签帧按 `vid` 隔离，`vid` 0 也是独立域。
+* 配置了 `access_vid` 的端口是接入口：进入接入口的未标记帧归入
+  `access_vid`（结果中的 `vid`、MAC 学习与查找、动态表老化与 VLAN 计数
+  都使用该内部 VLAN）；进入接入口的任何 802.1Q 标签帧（含 VID 0 或与
+  `access_vid` 相同的标签）一律 `dropped`，其结果 `vid` 与 VLAN 计数
+  使用帧标签 VID，且不学习、不查表、没有出口。帧自身的结构与长度仍先按
+  既有规则判定，未标记坏帧的结果 `vid` 仍取接入 VLAN。`access_vid` 只
+  定义 VLAN 归属，不改变由管理状态、转发状态和 learning 推导出的
+  `can_forward`/`can_learn`。
+* 泛洪（广播、组播与未命中单播）只可选择 `access_vid` 与帧内部 VLAN
+  相同的接入口，其他接入口不出现在 `egress_ports`；未配置 `access_vid`
+  的端口不受此限制，原样参与泛洪，并可与接入口共存。命中动态或静态
+  单播表项但目标接入口 VLAN 不匹配时 `dropped`，不退回泛洪。向匹配
+  接入口成功交付在公开语义上表示标签已剥除；`egress_ports` 仍只返回
+  端口名，不新增出口帧副本。
 * 仅合法、未被丢弃且入端口 `can_learn` 为真的帧，按 (VLAN, 规范化小写单播源 MAC)
   学习；同一键从另一端口出现时迁移到新端口。
 * 广播、组播与未命中单播泛洪到除入端口外所有 `can_forward` 为真的端口
