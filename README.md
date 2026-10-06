@@ -100,7 +100,8 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   `time_ms`；不同 VLAN 的同名 MAC 独立老化。处理不按时间跨度循环推进。
 * 输出为单行固定键序 JSON：版本标识、与输入一一对应的结果
   (event、vid、src_mac、dst_mac、decision、egress_ports；提供
-  `ingress_mirror` 时在 egress_ports 后追加 mirror_ports) 以及最终动态表快照
+  `ingress_mirror` 时在 egress_ports 后追加 mirror_ports；提供
+  `egress_mirror` 时再在其后追加 egress_mirror_ports) 以及最终动态表快照
   (按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序；仅含最后事件时刻仍有效
   的表项)。
 * 场景可选顶层 `include_counters`（布尔）：为 true 时在 `dynamic_table` 后
@@ -175,6 +176,25 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     `mirror_ports`：成功交付时为仅含 `destination_port` 的数组，否则为空数组
     （入口不属于源端口，或目的端口不可转发）。省略 `ingress_mirror` 时，
     现有校验、输出键序及逐字节结果保持不变。
+* 场景可选顶层 `egress_mirror` 对象声明唯一一个出口镜像会话，结构与
+  `ingress_mirror` 完全相同（仅含 `source_ports` 与 `destination_port`，
+  校验规则、错误类型与路径前缀 `$.egress_mirror...` 一一对应）。仅支持一个
+  出口镜像会话。
+  * 每个事件沿用既有的学习、老化、查表、VLAN 策略与普通转发规则得到最终
+    `egress_ports` 后，再判定出口镜像：只要其中至少一个实际交付端口属于
+    `source_ports`，就尝试向 `destination_port` 交付一份原始帧副本；泛洪
+    命中多个源端口也只产生一份。dropped、filtered 或无实际出口的事件不
+    产生副本；仅当目的端口 `can_forward` 为真时交付，其 `access_vid` 或
+    `trunk_vids` 不限制这份副本。
+  * 出口镜像副本不触发学习、刷新、迁移、老化、转发表变化或额外的
+    fdb_events 记录，也不会再次触发入口或出口镜像；每个事件最多产生一个
+    出口镜像副本，`include_counters` 的 egress_frames 只统计普通转发。
+  * 提供 `egress_mirror` 时，每条 results 记录在既有 `mirror_ports` 之后
+    （未启用入口镜像时紧随 `egress_ports`）追加 `egress_mirror_ports`：
+    成功交付时为仅含 `destination_port` 的数组，否则为空数组。入口与出口
+    会话可同时存在并各自独立判定；两个会话目的端口相同时也分别报告且
+    互不触发。省略 `egress_mirror` 时，现有校验、输出键序及逐字节结果
+    保持不变。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -183,7 +203,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port，或镜像源/目的端口) |
 
