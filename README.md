@@ -131,6 +131,26 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   快照（仅含 vid、mac、port，按 vid 数值升序、再按 mac 的 Unicode 码点
   升序）；`include_counters` 为真时 `counters` 位于其后。空数组等价于
   省略，省略时输出键、顺序与逐字节内容和此前一致。
+* 场景可选顶层 `include_fdb_events`（布尔）：为 true 时在现有所有输出区段
+  （含 `counters`）之后追加 `fdb_events` 数组，按输入事件顺序审计动态转发表
+  的实际变化；缺省或为 false 时输出与此前逐字节一致。`include_fdb_events`
+  不是布尔值时在处理任何事件前以 ConfigError（退出码 3，路径
+  `$.include_fdb_events`）失败，标准输出不写入部分结果。
+  * 每条记录按键序 event、kind、vid、mac、from_port、to_port；event 为与
+    results 相同的零基事件序号，mac 为规范化小写形式，kind 只取
+    `aged`、`learned`、`refreshed`、`moved`。老化删除记录 from_port 为原
+    端口、to_port 为 null；首次学习 from_port 为 null、to_port 为新端口；
+    同端口刷新两个端口字段都为当前端口；跨端口迁移为旧端口与新端口。
+  * 一个事件触发多条到期删除时，先按 vid 数值、再按 mac 的 Unicode 码点
+    升序记录全部 `aged`，随后再记录该帧产生的学习、刷新或迁移，因此同一键
+    可在一个事件中先 `aged` 再 `learned`。
+  * 只有实际提交到动态表的变化才写入：坏帧、不可转发或 VLAN 策略拒绝的帧、
+    禁止学习的端口、源键已有静态项，以及因 `dynamic_mac_limit` 已满而拒绝的
+    首次学习或迁移都不产生记录（额度不足的迁移保留旧项，不伪造 `moved`）；
+    老化即使由随后被丢弃的帧时刻触发也要记录；静态表从不进入该数组。
+    空事件或没有变化时为空数组；记录总数不超过事件数的两倍。
+  * 该审计开关不改变学习、转发、计数或最终表状态；相同场景的记录内容、
+    顺序与整行 JSON 逐字节一致。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -139,7 +159,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`static_table` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port 或静态项 port) |
 
