@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """l2-switch: 二层以太网交换的行为仿真与配置框架。
 
-提供物理端口配置校验与确定性状态快照 (ports 子命令)，
-以及以太帧的离线合法性判定 (frame 子命令)。
+提供物理端口配置校验与确定性状态快照 (ports 子命令)、
+以太帧的离线合法性判定 (frame 子命令)，
+以及场景内的动态 MAC 学习、查表与转发 (forward 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -16,9 +17,13 @@ MAX_PORTS = 4096
 MAX_PORT_NAME_LEN = 64
 MAX_FRAME_FILE_BYTES = 131072
 MAX_PAYLOAD_BYTES = 65535
+MAX_EVENTS = 10000
 
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
+FORWARD_SCHEMA = "l2-switch/forward-v1"
+# 未标记帧归入 VLAN 1；带标签帧按 vid 隔离，vid 0 也是独立域。
+UNTAGGED_VID = 1
 
 # 每个端口允许的字段及其规范顺序；额外字段一律拒绝。
 FIELD_ORDER = (
@@ -48,6 +53,15 @@ class ConfigError(Exception):
 
 class FrameError(Exception):
     """帧的结构、字段、类型、范围或格式不合法。path 为从 $ 开始的 JSON 路径。"""
+
+    def __init__(self, message, path):
+        super().__init__(message)
+        self.message = message
+        self.path = path
+
+
+class StateError(Exception):
+    """引用了不存在的物理端口等运行期状态错误。path 为从 $ 开始的 JSON 路径。"""
 
     def __init__(self, message, path):
         super().__init__(message)
@@ -393,22 +407,26 @@ FRAME_FIELD_CHECKS = {
 }
 
 
-def evaluate_frame(frame):
-    """校验帧描述并返回判定结果对象 (键序固定)。"""
+def evaluate_frame(frame, base="$"):
+    """校验帧描述并返回判定结果对象 (键序固定)。
+
+    base 为帧对象在 JSON 中的路径前缀；frame 子命令使用 "$"，
+    forward 场景中的嵌套帧使用 "$.events[i].frame"。
+    """
     if not isinstance(frame, dict):
-        raise FrameError("top-level frame must be an object", "$")
+        raise FrameError("top-level frame must be an object", base)
 
     # 按顶层键在输入中出现的顺序报告首个错误；遍历后再按规范顺序报告缺失字段。
     values = {}
     for field, value in frame.items():
-        path = "$." + field
+        path = base + "." + field
         if field not in FRAME_FIELD_SET:
             raise FrameError("unexpected field '%s'" % field, path)
         values[field] = FRAME_FIELD_CHECKS[field](value, path)
 
     for field in FRAME_FIELD_ORDER:
         if field not in values:
-            raise FrameError("missing field '%s'" % field, "$." + field)
+            raise FrameError("missing field '%s'" % field, base + "." + field)
 
     tagged = values["vlan"] is not None
     payload_bytes = len(values["payload_hex"]) // 2
@@ -468,17 +486,224 @@ def cmd_frame(args):
     return 0
 
 
+EVENT_FIELD_ORDER = ("ingress_port", "frame")
+EVENT_FIELD_SET = frozenset(EVENT_FIELD_ORDER)
+
+
+def read_scenario(path):
+    """读取并解析 UTF-8 JSON 场景；读取/解码/解析失败抛 ValueError。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        # 使用固定消息，避免平台/locale 文本差异影响确定性。
+        raise ValueError("cannot read scenario file")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("scenario file is not valid UTF-8")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        # JSONDecodeError 是 ValueError 的子类；超长整数等解析限制同样归为输入错误。
+        raise ValueError("scenario file is not valid JSON")
+
+
+def validate_scenario(scenario):
+    """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
+
+    返回 (port_by_name, validated_events)：
+    port_by_name 将端口 name 映射为 {"can_forward", "can_learn"}；
+    validated_events 每项为 (ingress_name, 帧判定结果)。
+    """
+    if not isinstance(scenario, dict):
+        raise ConfigError("top-level scenario must be an object", "$")
+
+    # 按顶层键在输入中出现的顺序报告首个错误；遍历后再按规范顺序报告缺失字段。
+    seen_fields = set()
+    for field, value in scenario.items():
+        path = "$." + field
+        if field not in ("ports", "events"):
+            raise ConfigError("unexpected field '%s'" % field, path)
+        seen_fields.add(field)
+
+    if "ports" not in seen_fields:
+        raise ConfigError("missing field 'ports'", "$.ports")
+    if "events" not in seen_fields:
+        raise FrameError("missing field 'events'", "$.events")
+
+    ports = scenario["ports"]
+    if not isinstance(ports, list):
+        raise ConfigError("'ports' must be an array", "$.ports")
+    if len(ports) > MAX_PORTS:
+        raise ConfigError(
+            "number of ports exceeds maximum of %d" % MAX_PORTS, "$.ports"
+        )
+
+    events = scenario["events"]
+    if not isinstance(events, list):
+        raise FrameError("'events' must be an array", "$.events")
+    if len(events) > MAX_EVENTS:
+        raise FrameError(
+            "number of events exceeds maximum of %d" % MAX_EVENTS, "$.events"
+        )
+
+    port_names = set()
+    port_by_name = {}
+    for index, item in enumerate(ports):
+        ordered, can_forward, can_learn = validate_port(item, index, port_names)
+        name = ordered[0][1]
+        port_by_name[name] = {
+            "can_forward": can_forward,
+            "can_learn": can_learn,
+        }
+
+    validated_events = []
+    for index, item in enumerate(events):
+        base = "$.events[%d]" % index
+        if not isinstance(item, dict):
+            raise FrameError("event must be an object", base)
+
+        values = {}
+        for field, value in item.items():
+            path = base + "." + field
+            if field not in EVENT_FIELD_SET:
+                raise FrameError("unexpected field '%s'" % field, path)
+            values[field] = value
+
+        for field in EVENT_FIELD_ORDER:
+            if field not in values:
+                raise FrameError(
+                    "missing field '%s'" % field, base + "." + field
+                )
+
+        ingress = values["ingress_port"]
+        if not isinstance(ingress, str):
+            raise FrameError("'ingress_port' must be a string", base + ".ingress_port")
+        # 未知入端口在全部结构/帧校验完成后仍属于处理前引用检查。
+        if ingress not in port_by_name:
+            raise StateError(
+                "unknown ingress port '%s'" % ingress, base + ".ingress_port"
+            )
+
+        verdict = evaluate_frame(values["frame"], base + ".frame")
+        validated_events.append((ingress, verdict))
+
+    return port_by_name, validated_events
+
+
+def run_scenario(scenario):
+    """校验并按顺序处理场景，返回固定键序的结果对象。"""
+    port_by_name, events = validate_scenario(scenario)
+
+    # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
+    flood_ports = sorted(
+        name
+        for name, attrs in port_by_name.items()
+        if attrs["can_forward"]
+    )
+
+    # 动态表：键为 (vid, 小写单播源 MAC)，值为学习到的端口 name。
+    table = {}
+    results = []
+
+    for index, (ingress, verdict) in enumerate(events):
+        vid = verdict["vlan"]["vid"] if verdict["vlan"] is not None else UNTAGGED_VID
+        src_mac = verdict["src_mac"]
+        dst_mac = verdict["dst_mac"]
+        ingress_attrs = port_by_name[ingress]
+
+        egress = []
+        # runt、oversize 或 bad_fcs：一律 dropped，不学习、不查表、无出口。
+        # 入端口不能转发：该事件确定为 dropped。
+        if not verdict["valid"] or not ingress_attrs["can_forward"]:
+            decision = "dropped"
+        else:
+            # 仅在入端口 can_learn 时按 (VLAN, 规范化源 MAC) 学习；
+            # 同一键从另一端口出现时迁移到新端口。
+            if ingress_attrs["can_learn"]:
+                table[(vid, src_mac)] = ingress
+
+            if verdict["destination_type"] == "unicast":
+                hit = table.get((vid, dst_mac))
+                if hit is None:
+                    # 未命中单播泛洪。
+                    decision = "flooded"
+                    egress = [name for name in flood_ports if name != ingress]
+                elif hit == ingress:
+                    # 命中入端口：过滤，出口为空。
+                    decision = "filtered"
+                else:
+                    # 命中单播仅发往表项端口。
+                    decision = "forwarded"
+                    egress = [hit]
+            else:
+                # 广播与组播泛洪到除入端口外所有 can_forward 端口。
+                decision = "flooded"
+                egress = [name for name in flood_ports if name != ingress]
+
+        results.append(
+            {
+                "event": index,
+                "vid": vid,
+                "src_mac": src_mac,
+                "dst_mac": dst_mac,
+                "decision": decision,
+                "egress_ports": egress,
+            }
+        )
+
+    # 表项按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序排列。
+    entries = [
+        {"vid": vid, "mac": mac, "port": port}
+        for (vid, mac), port in sorted(table.items(), key=lambda kv: kv[0])
+    ]
+
+    return {
+        "schema": FORWARD_SCHEMA,
+        "results": results,
+        "dynamic_table": entries,
+    }
+
+
+def cmd_forward(args):
+    try:
+        scenario = read_scenario(args.scenario)
+    except ValueError as exc:
+        emit_error("InputError", str(exc))
+        return 2
+
+    try:
+        result = run_scenario(scenario)
+    except ConfigError as exc:
+        emit_error("ConfigError", exc.message, exc.path)
+        return 3
+    except FrameError as exc:
+        emit_error("FrameError", exc.message, exc.path)
+        return 4
+    except StateError as exc:
+        emit_error("StateError", exc.message, exc.path)
+        return 5
+
+    sys.stdout.buffer.write(
+        (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="l2_switch.py",
         description=(
             "l2-switch: 二层以太网交换的行为仿真与配置框架。"
-            "支持物理端口配置校验与确定性状态快照，以及以太帧的离线合法性判定。"
+            "支持物理端口配置校验与确定性状态快照、以太帧的离线合法性判定，"
+            "以及场景内的动态 MAC 学习、查表与转发。"
         ),
         epilog=(
             "限制: 端口数量上限为 %d；单个端口 name 长度上限为 %d 个字符；"
-            "帧描述文件大小上限为 %d 字节。仅使用 Python 标准库，不联网。"
-            % (MAX_PORTS, MAX_PORT_NAME_LEN, MAX_FRAME_FILE_BYTES)
+            "帧描述文件大小上限为 %d 字节；场景事件数量上限为 %d。"
+            "仅使用 Python 标准库，不联网。"
+            % (MAX_PORTS, MAX_PORT_NAME_LEN, MAX_FRAME_FILE_BYTES, MAX_EVENTS)
         ),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="command")
@@ -526,6 +751,34 @@ def build_parser():
         ),
     )
     frame_parser.set_defaults(func=cmd_frame)
+
+    forward_parser = subparsers.add_parser(
+        "forward",
+        help="按场景顺序处理事件，执行动态学习、查表与转发",
+        description=(
+            "读取 UTF-8 JSON 场景 (ports 配置与按顺序排列的 events)，"
+            "先完整校验，再按事件顺序执行场景内动态 MAC 表的学习、查表与转发，"
+            "并向标准输出写入单行 JSON 结果。"
+            "未标记帧归入 VLAN 1，带标签帧按 vid 隔离，vid 0 也作为独立域。"
+            "不含静态表项、老化、端口模式、计数或跨进程持久化。"
+        ),
+        epilog=(
+            "限制: 端口数量上限为 %d；事件数量上限为 %d。"
+            "泛洪出口按端口 name 的 Unicode 码点升序排列；"
+            "相同输入的输出逐字节一致。"
+            % (MAX_PORTS, MAX_EVENTS)
+        ),
+    )
+    forward_parser.add_argument(
+        "--scenario",
+        required=True,
+        metavar="FILE",
+        help=(
+            "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组；"
+            "每个事件包含 ingress_port 与完整 frame 描述"
+        ),
+    )
+    forward_parser.set_defaults(func=cmd_forward)
 
     return parser
 
