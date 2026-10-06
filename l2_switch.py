@@ -27,6 +27,7 @@ FORWARD_SCHEMA = "l2-switch/forward-v1"
 UNTAGGED_VID = 1
 
 # 每个端口允许的字段及其规范顺序；额外字段一律拒绝。
+# access_vid 为可选的接入 VLAN 归属，缺省时不出现在快照中。
 FIELD_ORDER = (
     "name",
     "kind",
@@ -35,8 +36,13 @@ FIELD_ORDER = (
     "learning",
     "speed_mbps",
     "duplex",
+    "access_vid",
 )
 FIELD_SET = frozenset(FIELD_ORDER)
+OPTIONAL_FIELDS = frozenset(("access_vid",))
+
+MIN_ACCESS_VID = 1
+MAX_ACCESS_VID = 4094
 
 ADMIN_STATES = frozenset(("up", "down"))
 FORWARDING_STATES = frozenset(("forwarding", "blocking"))
@@ -175,6 +181,19 @@ def _check_duplex(value, path):
     return value
 
 
+def _check_access_vid(value, path):
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'access_vid' must be an integer", path)
+    if value < MIN_ACCESS_VID or value > MAX_ACCESS_VID:
+        raise ConfigError(
+            "'access_vid' must be between %d and %d"
+            % (MIN_ACCESS_VID, MAX_ACCESS_VID),
+            path,
+        )
+    return value
+
+
 FIELD_CHECKS = {
     "name": _check_name,
     "kind": _check_kind,
@@ -183,6 +202,7 @@ FIELD_CHECKS = {
     "learning": _check_learning,
     "speed_mbps": _check_speed_mbps,
     "duplex": _check_duplex,
+    "access_vid": _check_access_vid,
 }
 
 
@@ -190,7 +210,8 @@ def validate_port(item, index, seen):
     """校验单个端口，按输入字段顺序返回 (有序字段, can_forward, can_learn)。
 
     按字段在输入中出现的顺序报告首个错误 (未知字段、非法值或重复 name 立即
-    报告)；仅当所有出现字段均合法后，才按规范字段顺序报告首个缺失字段。
+    报告)；仅当所有出现字段均合法后，才按规范字段顺序报告首个缺失字段
+    (可选字段 access_vid 不参与缺失检查)。
     """
     base = "$.ports[%d]" % index
 
@@ -212,7 +233,7 @@ def validate_port(item, index, seen):
         values[field] = checked
 
     for field in FIELD_ORDER:
-        if field not in values:
+        if field not in values and field not in OPTIONAL_FIELDS:
             raise ConfigError("missing field '%s'" % field, base + "." + field)
 
     admin_state = values["admin_state"]
@@ -221,7 +242,7 @@ def validate_port(item, index, seen):
     can_forward = admin_state == "up" and forwarding_state == "forwarding"
     can_learn = can_forward and learning
 
-    ordered = [(field, values[field]) for field in FIELD_ORDER]
+    ordered = [(field, values[field]) for field in FIELD_ORDER if field in values]
     return ordered, can_forward, can_learn
 
 
@@ -642,7 +663,8 @@ def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
-    static_map)：port_by_name 将端口 name 映射为 {"can_forward", "can_learn"}；
+    static_map)：port_by_name 将端口 name 映射为 {"can_forward", "can_learn",
+    "access_vid"} (未配置 access_vid 时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
     include_counters 缺省或为 false 时为 False，输出不含 counters；
@@ -700,10 +722,13 @@ def validate_scenario(scenario):
     port_by_name = {}
     for index, item in enumerate(ports):
         ordered, can_forward, can_learn = validate_port(item, index, port_names)
-        name = ordered[0][1]
+        fields = dict(ordered)
+        name = fields["name"]
         port_by_name[name] = {
             "can_forward": can_forward,
             "can_learn": can_learn,
+            # 未配置 access_vid 时为 None，表示不参与接入口 VLAN 限制。
+            "access_vid": fields.get("access_vid"),
         }
 
     # 静态表在 ports 之后、events 之前校验；端口引用检查依赖 port_by_name。
@@ -790,6 +815,12 @@ def run_scenario(scenario):
     table = {}
     results = []
 
+    def vlan_allows(port_name, vid):
+        # 接入口只承载与其 access_vid 相同的内部 VLAN；未配置 access_vid
+        # 的端口不受接入 VLAN 限制，按既有语义参与转发。
+        access_vid = port_by_name[port_name]["access_vid"]
+        return access_vid is None or access_vid == vid
+
     for index, (ingress, verdict, time_ms) in enumerate(events):
         # 老化由显式事件时钟驱动：在处理该帧之前，一次性删除所有
         # 当前时间减去最后刷新时间大于等于 aging_time_ms 的表项。
@@ -804,15 +835,31 @@ def run_scenario(scenario):
             for key in expired:
                 del table[key]
 
-        vid = verdict["vlan"]["vid"] if verdict["vlan"] is not None else UNTAGGED_VID
+        ingress_attrs = port_by_name[ingress]
+        access_vid = ingress_attrs["access_vid"]
+        tagged = verdict["vlan"] is not None
+        if tagged:
+            # 带标签帧的内部 VLAN 取其标签 VID；在接入口上这也是违例事件的
+            # 结果 vid 与 VLAN 计数归属。
+            vid = verdict["vlan"]["vid"]
+        elif access_vid is not None:
+            # 接入口上的未标记帧 (含坏帧) 归入其接入 VLAN。
+            vid = access_vid
+        else:
+            vid = UNTAGGED_VID
         src_mac = verdict["src_mac"]
         dst_mac = verdict["dst_mac"]
-        ingress_attrs = port_by_name[ingress]
 
         egress = []
         # runt、oversize 或 bad_fcs：一律 dropped，不学习、不查表、无出口。
         # 入端口不能转发：该事件确定为 dropped。
-        if not verdict["valid"] or not ingress_attrs["can_forward"]:
+        # 接入口收到任何带 802.1Q 标签的帧 (含 VID 0 或与 access_vid 相同)：
+        # 接入策略违例，dropped，不学习、不查表、无出口。
+        if (
+            not verdict["valid"]
+            or not ingress_attrs["can_forward"]
+            or (tagged and access_vid is not None)
+        ):
             decision = "dropped"
         else:
             # 仅在入端口 can_learn 时按 (VLAN, 规范化源 MAC) 学习/刷新；
@@ -824,11 +871,13 @@ def run_scenario(scenario):
             if verdict["destination_type"] == "unicast":
                 static_port = static_map.get((vid, dst_mac))
                 if static_port is not None:
-                    # 静态项优先：命中入端口时过滤；目标端口 down 或
-                    # blocking 时丢弃；均不退回未知单播泛洪。
+                    # 静态项优先：命中入端口时过滤；目标端口 down、blocking
+                    # 或目标接入口 VLAN 不匹配时丢弃；均不退回未知单播泛洪。
                     if static_port == ingress:
                         decision = "filtered"
                     elif not port_by_name[static_port]["can_forward"]:
+                        decision = "dropped"
+                    elif not vlan_allows(static_port, vid):
                         decision = "dropped"
                     else:
                         decision = "forwarded"
@@ -836,20 +885,32 @@ def run_scenario(scenario):
                 else:
                     hit_entry = table.get((vid, dst_mac))
                     if hit_entry is None:
-                        # 未命中单播泛洪。
+                        # 未命中单播泛洪；接入口仅在内部 VLAN 匹配时成为出口。
                         decision = "flooded"
-                        egress = [name for name in flood_ports if name != ingress]
+                        egress = [
+                            name
+                            for name in flood_ports
+                            if name != ingress and vlan_allows(name, vid)
+                        ]
                     elif hit_entry[0] == ingress:
                         # 命中入端口：过滤，出口为空。
                         decision = "filtered"
+                    elif not vlan_allows(hit_entry[0], vid):
+                        # 目标接入口 VLAN 不匹配：丢弃，不退回泛洪。
+                        decision = "dropped"
                     else:
                         # 命中单播仅发往表项端口。
                         decision = "forwarded"
                         egress = [hit_entry[0]]
             else:
-                # 广播与组播泛洪到除入端口外所有 can_forward 端口。
+                # 广播与组播泛洪到除入端口外所有 can_forward 且
+                # 接入 VLAN 匹配 (或未配置 access_vid) 的端口。
                 decision = "flooded"
-                egress = [name for name in flood_ports if name != ingress]
+                egress = [
+                    name
+                    for name in flood_ports
+                    if name != ingress and vlan_allows(name, vid)
+                ]
 
         results.append(
             {
@@ -1022,6 +1083,9 @@ def build_parser():
             "先完整校验，再按事件顺序执行场景内动态 MAC 表的学习、查表与转发，"
             "并向标准输出写入单行 JSON 结果。"
             "未标记帧归入 VLAN 1，带标签帧按 vid 隔离，vid 0 也作为独立域。"
+            "端口可选 access_vid (1..4094) 声明接入 VLAN：该端口上的未标记帧"
+            "归入接入 VLAN，任何带标签帧均作为接入策略违例丢弃；"
+            "只有内部 VLAN 与 access_vid 相同的接入口才能成为出口。"
             "场景可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
             "可选 static_table 声明始终有效、不参与老化且不被学习覆盖的静态表项，"
             "单播目的查找优先匹配静态项；"
