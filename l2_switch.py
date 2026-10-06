@@ -29,6 +29,8 @@ UNTAGGED_VID = 1
 # 每个端口允许的字段及其规范顺序；额外字段一律拒绝。
 # access_vid 为可选的接入 VLAN 归属，trunk_vids 为可选的中继 VLAN 允许数组，
 # 二者互斥，缺省时都不出现在快照中。
+# dynamic_mac_limit 为可选的端口动态 MAC 学习数量上限 (端口安全)，
+# 缺省时不出现在快照中且保持无限制语义。
 FIELD_ORDER = (
     "name",
     "kind",
@@ -39,15 +41,19 @@ FIELD_ORDER = (
     "duplex",
     "access_vid",
     "trunk_vids",
+    "dynamic_mac_limit",
 )
 FIELD_SET = frozenset(FIELD_ORDER)
-OPTIONAL_FIELDS = frozenset(("access_vid", "trunk_vids"))
+OPTIONAL_FIELDS = frozenset(("access_vid", "trunk_vids", "dynamic_mac_limit"))
 
 MIN_ACCESS_VID = 1
 MAX_ACCESS_VID = 4094
 
 MIN_TRUNK_VID = 1
 MAX_TRUNK_VID = 4094
+
+MIN_DYNAMIC_MAC_LIMIT = 1
+MAX_DYNAMIC_MAC_LIMIT = 10000
 
 ADMIN_STATES = frozenset(("up", "down"))
 FORWARDING_STATES = frozenset(("forwarding", "blocking"))
@@ -227,6 +233,19 @@ def _check_trunk_vids(value, path):
     return sorted(value)
 
 
+def _check_dynamic_mac_limit(value, path):
+    # 可选的端口动态 MAC 学习数量上限；bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'dynamic_mac_limit' must be an integer", path)
+    if value < MIN_DYNAMIC_MAC_LIMIT or value > MAX_DYNAMIC_MAC_LIMIT:
+        raise ConfigError(
+            "'dynamic_mac_limit' must be between %d and %d"
+            % (MIN_DYNAMIC_MAC_LIMIT, MAX_DYNAMIC_MAC_LIMIT),
+            path,
+        )
+    return value
+
+
 FIELD_CHECKS = {
     "name": _check_name,
     "kind": _check_kind,
@@ -237,6 +256,7 @@ FIELD_CHECKS = {
     "duplex": _check_duplex,
     "access_vid": _check_access_vid,
     "trunk_vids": _check_trunk_vids,
+    "dynamic_mac_limit": _check_dynamic_mac_limit,
 }
 
 
@@ -704,7 +724,8 @@ def validate_scenario(scenario):
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
     static_map)：port_by_name 将端口 name 映射为 {"can_forward", "can_learn",
-    "access_vid", "trunk_vids"} (未配置对应 VLAN 模式时为 None)；
+    "access_vid", "trunk_vids", "dynamic_mac_limit"} (未配置对应 VLAN 模式或
+    学习上限时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
     include_counters 缺省或为 false 时为 False，输出不含 counters；
@@ -772,6 +793,8 @@ def validate_scenario(scenario):
             # 未配置 trunk_vids 时为 None，表示不参与中继 VLAN 限制；
             # 配置时为按数值升序规范化后的允许 VID 数组。
             "trunk_vids": fields.get("trunk_vids"),
+            # 未配置 dynamic_mac_limit 时为 None，表示动态学习数量无限制。
+            "dynamic_mac_limit": fields.get("dynamic_mac_limit"),
         }
 
     # 静态表在 ports 之后、events 之前校验；端口引用检查依赖 port_by_name。
@@ -856,6 +879,9 @@ def run_scenario(scenario):
     # 动态表：键为 (vid, 小写单播源 MAC)；
     # 启用老化时值为 (学习到的端口 name, 最后刷新时间)，未启用时刷新时间为 None。
     table = {}
+    # 当前绑定到每个端口的动态表项总数 (不区分 VLAN)，供端口安全上限做 O(1)
+    # 检查；随老化删除、首次学习与跨端口迁移同步增减，静态项从不计入。
+    port_dynamic_counts = {name: 0 for name in port_by_name}
     results = []
 
     def vlan_allows(port_name, vid):
@@ -881,7 +907,10 @@ def run_scenario(scenario):
                 if time_ms - refreshed_at >= aging_time_ms
             ]
             for key in expired:
+                # 刚到期的表项立即释放其端口的学习额度。
+                old_port = table[key][0]
                 del table[key]
+                port_dynamic_counts[old_port] -= 1
 
         ingress_attrs = port_by_name[ingress]
         access_vid = ingress_attrs["access_vid"]
@@ -918,55 +947,87 @@ def run_scenario(scenario):
         ):
             decision = "dropped"
         else:
-            # 仅在入端口 can_learn 时按 (VLAN, 规范化源 MAC) 学习/刷新；
-            # 同一键从另一端口出现时迁移到新端口，同时刷新时间。
-            # 源 MAC 在同 VLAN 已有静态项时，不为该键创建或更新动态项。
-            if ingress_attrs["can_learn"] and (vid, src_mac) not in static_map:
-                table[(vid, src_mac)] = (ingress, time_ms)
+            # 仅在入端口 can_learn 且该 (VLAN, 规范化源 MAC) 无静态项时才
+            # 考虑动态学习、刷新或迁移；源键已有静态项或端口禁止学习时不触发
+            # 端口安全违例。
+            learn_key = (vid, src_mac)
+            will_learn = (
+                ingress_attrs["can_learn"] and learn_key not in static_map
+            )
+            existing_entry = table.get(learn_key) if will_learn else None
 
-            if verdict["destination_type"] == "unicast":
-                static_port = static_map.get((vid, dst_mac))
-                if static_port is not None:
-                    # 静态项优先：命中入端口时过滤；目标端口 down、blocking
-                    # 或目标接入口 VLAN 不匹配时丢弃；均不退回未知单播泛洪。
-                    if static_port == ingress:
-                        decision = "filtered"
-                    elif not port_by_name[static_port]["can_forward"]:
-                        decision = "dropped"
-                    elif not vlan_allows(static_port, vid):
-                        decision = "dropped"
+            # 端口安全：已在同一端口的动态源只刷新、不占新额度；首次学习或
+            # 从其他端口迁入需要一个新额度。上限按当前绑定到入端口的动态表项
+            # 总数计算 (不区分 VLAN，静态项不占额度)；检查发生在本次老化清理
+            # 之后，刚到期的表项已释放额度。
+            port_security_violation = False
+            if (
+                will_learn
+                and (existing_entry is None or existing_entry[0] != ingress)
+                and ingress_attrs["dynamic_mac_limit"] is not None
+                and port_dynamic_counts[ingress]
+                >= ingress_attrs["dynamic_mac_limit"]
+            ):
+                # 上限已满：本事件固定 dropped 且出口为空；不做目的查表，
+                # 不新增、刷新或迁移任何动态项 (迁入失败时旧端口原表项保持原状)。
+                port_security_violation = True
+                decision = "dropped"
+
+            if not port_security_violation:
+                if will_learn:
+                    if existing_entry is None:
+                        # 首次学习占用一个新额度。
+                        port_dynamic_counts[ingress] += 1
+                    elif existing_entry[0] != ingress:
+                        # 跨端口迁移：旧端口释放额度，新端口占用额度。
+                        port_dynamic_counts[existing_entry[0]] -= 1
+                        port_dynamic_counts[ingress] += 1
+                    # 同端口刷新仅更新刷新时间，额度不变；以上情形都写入/刷新表项。
+                    table[learn_key] = (ingress, time_ms)
+
+                if verdict["destination_type"] == "unicast":
+                    static_port = static_map.get((vid, dst_mac))
+                    if static_port is not None:
+                        # 静态项优先：命中入端口时过滤；目标端口 down、blocking
+                        # 或目标接入口 VLAN 不匹配时丢弃；均不退回未知单播泛洪。
+                        if static_port == ingress:
+                            decision = "filtered"
+                        elif not port_by_name[static_port]["can_forward"]:
+                            decision = "dropped"
+                        elif not vlan_allows(static_port, vid):
+                            decision = "dropped"
+                        else:
+                            decision = "forwarded"
+                            egress = [static_port]
                     else:
-                        decision = "forwarded"
-                        egress = [static_port]
+                        hit_entry = table.get((vid, dst_mac))
+                        if hit_entry is None:
+                            # 未命中单播泛洪；接入口仅在内部 VLAN 匹配时成为出口。
+                            decision = "flooded"
+                            egress = [
+                                name
+                                for name in flood_ports
+                                if name != ingress and vlan_allows(name, vid)
+                            ]
+                        elif hit_entry[0] == ingress:
+                            # 命中入端口：过滤，出口为空。
+                            decision = "filtered"
+                        elif not vlan_allows(hit_entry[0], vid):
+                            # 目标接入口 VLAN 不匹配：丢弃，不退回泛洪。
+                            decision = "dropped"
+                        else:
+                            # 命中单播仅发往表项端口。
+                            decision = "forwarded"
+                            egress = [hit_entry[0]]
                 else:
-                    hit_entry = table.get((vid, dst_mac))
-                    if hit_entry is None:
-                        # 未命中单播泛洪；接入口仅在内部 VLAN 匹配时成为出口。
-                        decision = "flooded"
-                        egress = [
-                            name
-                            for name in flood_ports
-                            if name != ingress and vlan_allows(name, vid)
-                        ]
-                    elif hit_entry[0] == ingress:
-                        # 命中入端口：过滤，出口为空。
-                        decision = "filtered"
-                    elif not vlan_allows(hit_entry[0], vid):
-                        # 目标接入口 VLAN 不匹配：丢弃，不退回泛洪。
-                        decision = "dropped"
-                    else:
-                        # 命中单播仅发往表项端口。
-                        decision = "forwarded"
-                        egress = [hit_entry[0]]
-            else:
-                # 广播与组播泛洪到除入端口外所有 can_forward 且
-                # 接入 VLAN 匹配 (或未配置 access_vid) 的端口。
-                decision = "flooded"
-                egress = [
-                    name
-                    for name in flood_ports
-                    if name != ingress and vlan_allows(name, vid)
-                ]
+                    # 广播与组播泛洪到除入端口外所有 can_forward 且
+                    # 接入 VLAN 匹配 (或未配置 access_vid) 的端口。
+                    decision = "flooded"
+                    egress = [
+                        name
+                        for name in flood_ports
+                        if name != ingress and vlan_allows(name, vid)
+                    ]
 
         results.append(
             {
@@ -1146,6 +1207,10 @@ def build_parser():
             " 互斥) 声明中继允许承载的 VLAN：该端口只接收 VID 在允许数组中的"
             "带标签帧，未标记帧与 VID 0 或不允许的标签帧作为中继策略违例丢弃；"
             "只有内部 VLAN 被允许的中继端口才能成为出口。"
+            "端口可选 dynamic_mac_limit (1..10000 的整数) 限制绑定到该端口的"
+            "动态 MAC 学习数量 (不区分 VLAN，静态项不占额度)：合法帧首次学习或"
+            "跨端口迁入而额度已满时该事件 dropped、无出口且不改变动态表，"
+            "同端口刷新不占额度，老化到期立即释放额度，省略时无限制。"
             "场景可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
             "可选 static_table 声明始终有效、不参与老化且不被学习覆盖的静态表项，"
             "单播目的查找优先匹配静态项；"
