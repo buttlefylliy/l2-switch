@@ -604,6 +604,13 @@ def _check_include_counters(value, path):
     return value
 
 
+def _check_include_fdb_events(value, path):
+    # include_fdb_events 是场景级开关，类型错误归 ConfigError。
+    if not isinstance(value, bool):
+        raise ConfigError("'include_fdb_events' must be a boolean", path)
+    return value
+
+
 def _check_aging_time_ms(value, path):
     # aging_time_ms 是场景级配置字段，类型/范围错误归 ConfigError。
     if isinstance(value, bool) or not isinstance(value, int):
@@ -723,14 +730,15 @@ def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
-    static_map)：port_by_name 将端口 name 映射为 {"can_forward", "can_learn",
-    "access_vid", "trunk_vids", "dynamic_mac_limit"} (未配置对应 VLAN 模式或
-    学习上限时为 None)；
+    static_map, include_fdb_events)：port_by_name 将端口 name 映射为
+    {"can_forward", "can_learn", "access_vid", "trunk_vids",
+    "dynamic_mac_limit"} (未配置对应 VLAN 模式或学习上限时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
     include_counters 缺省或为 false 时为 False，输出不含 counters；
     static_map 键为 (vid, 小写 mac)、值为端口 name，未提供 static_table
-    或其为空数组时为空映射，输出不含 static_table。
+    或其为空数组时为空映射，输出不含 static_table；
+    include_fdb_events 缺省或为 false 时为 False，输出不含 fdb_events。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -739,6 +747,7 @@ def validate_scenario(scenario):
     seen_fields = set()
     aging_time_ms = None
     include_counters = False
+    include_fdb_events = False
     for field, value in scenario.items():
         path = "$." + field
         if field == "ports":
@@ -751,6 +760,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "include_counters":
             include_counters = _check_include_counters(value, path)
+            seen_fields.add(field)
+        elif field == "include_fdb_events":
+            include_fdb_events = _check_include_fdb_events(value, path)
             seen_fields.add(field)
         elif field == "static_table":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
@@ -850,14 +862,26 @@ def validate_scenario(scenario):
         event_time = values["time_ms"] if aging_time_ms is not None else None
         validated_events.append((ingress, verdict, event_time))
 
-    return port_by_name, validated_events, aging_time_ms, include_counters, static_map
+    return (
+        port_by_name,
+        validated_events,
+        aging_time_ms,
+        include_counters,
+        static_map,
+        include_fdb_events,
+    )
 
 
 def run_scenario(scenario):
     """校验并按顺序处理场景，返回固定键序的结果对象。"""
-    port_by_name, events, aging_time_ms, include_counters, static_map = (
-        validate_scenario(scenario)
-    )
+    (
+        port_by_name,
+        events,
+        aging_time_ms,
+        include_counters,
+        static_map,
+        include_fdb_events,
+    ) = validate_scenario(scenario)
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -884,6 +908,10 @@ def run_scenario(scenario):
     port_dynamic_counts = {name: 0 for name in port_by_name}
     results = []
 
+    # 动态表变化审计仅在 include_fdb_events 为真时记录；只读取已提交的
+    # 表变化，不参与学习、迁移、查表或转发决定。
+    fdb_events = [] if include_fdb_events else None
+
     def vlan_allows(port_name, vid):
         # 接入口只承载与其 access_vid 相同的内部 VLAN；中继端口只承载
         # trunk_vids 允许的内部 VLAN；两种 VLAN 模式都未配置的端口不受
@@ -901,16 +929,30 @@ def run_scenario(scenario):
         # 恰好到期的表项已失效；不按时间跨度循环推进。
         # 坏帧与不可转发事件的时间同样触发本次清理。
         if aging_time_ms is not None:
-            expired = [
+            # 同一事件的多条到期删除按 vid 数值、再按 mac 的 Unicode 码点
+            # 升序处理并记录；删除顺序不影响删后的表状态。
+            expired = sorted(
                 key
                 for key, (_, refreshed_at) in table.items()
                 if time_ms - refreshed_at >= aging_time_ms
-            ]
+            )
             for key in expired:
                 # 刚到期的表项立即释放其端口的学习额度。
                 old_port = table[key][0]
                 del table[key]
                 port_dynamic_counts[old_port] -= 1
+                if fdb_events is not None:
+                    # 老化删除即使由随后被丢弃的帧时刻触发也照常记录。
+                    fdb_events.append(
+                        {
+                            "event": index,
+                            "kind": "aged",
+                            "vid": key[0],
+                            "mac": key[1],
+                            "from_port": old_port,
+                            "to_port": None,
+                        }
+                    )
 
         ingress_attrs = port_by_name[ingress]
         access_vid = ingress_attrs["access_vid"]
@@ -978,12 +1020,32 @@ def run_scenario(scenario):
                     if existing_entry is None:
                         # 首次学习占用一个新额度。
                         port_dynamic_counts[ingress] += 1
+                        fdb_kind = "learned"
+                        fdb_from_port = None
                     elif existing_entry[0] != ingress:
                         # 跨端口迁移：旧端口释放额度，新端口占用额度。
                         port_dynamic_counts[existing_entry[0]] -= 1
                         port_dynamic_counts[ingress] += 1
+                        fdb_kind = "moved"
+                        fdb_from_port = existing_entry[0]
+                    else:
+                        fdb_kind = "refreshed"
+                        fdb_from_port = ingress
                     # 同端口刷新仅更新刷新时间，额度不变；以上情形都写入/刷新表项。
                     table[learn_key] = (ingress, time_ms)
+                    if fdb_events is not None:
+                        # 只有实际提交到动态表的变化才记录；端口安全拒绝、
+                        # 禁止学习、静态源键与被丢弃的帧都不产生记录。
+                        fdb_events.append(
+                            {
+                                "event": index,
+                                "kind": fdb_kind,
+                                "vid": vid,
+                                "mac": src_mac,
+                                "from_port": fdb_from_port,
+                                "to_port": ingress,
+                            }
+                        )
 
                 if verdict["destination_type"] == "unicast":
                     static_port = static_map.get((vid, dst_mac))
@@ -1103,6 +1165,12 @@ def run_scenario(scenario):
             ],
         }
 
+    if include_fdb_events:
+        # 动态表变化审计位于所有既有输出区段之后；按输入事件顺序排列，
+        # 同一事件内先按 vid、mac 升序记录全部 aged，再记录该帧产生的
+        # learned/refreshed/moved。空事件或没有变化时为空数组。
+        output["fdb_events"] = fdb_events
+
     return output
 
 
@@ -1215,7 +1283,9 @@ def build_parser():
             "可选 static_table 声明始终有效、不参与老化且不被学习覆盖的静态表项，"
             "单播目的查找优先匹配静态项；"
             "可选 include_counters 为 true 时在 dynamic_table 后追加本次场景的"
-            "端口与 VLAN 帧计数；无端口模式或跨进程持久化。"
+            "端口与 VLAN 帧计数；"
+            "可选 include_fdb_events 为 true 时在所有输出区段之后追加动态表"
+            "变化审计 (aged/learned/refreshed/moved)；无端口模式或跨进程持久化。"
         ),
         epilog=(
             "限制: 端口数量上限为 %d；事件数量上限为 %d；静态表项数量上限为 %d。"
@@ -1238,7 +1308,8 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
-            "可选 aging_time_ms、static_table 与 include_counters；每个事件包含 "
+            "可选 aging_time_ms、static_table、include_counters 与 "
+            "include_fdb_events；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化时每个事件还需包含 time_ms"
         ),
     )
