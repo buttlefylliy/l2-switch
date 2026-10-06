@@ -206,6 +206,29 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     交付时为仅含 `destination_port` 的数组，否则为空数组（无实际出口、实际
     出口均不属于源端口，或目的端口不可转发）。省略 `egress_mirror` 时，
     ports、frame、forward 的校验、输出键序、退出码及逐字节结果保持不变。
+* 场景可选顶层 `ingress_acl` 数组（最多 4096 条规则）声明有序无状态入口
+  过滤：每条规则为仅含 `action` 与匹配字段的对象，`action` 取 `allow`
+  或 `drop`，并至少给出 `src_mac`、`dst_mac`、`vid`、`ether_type`、`pcp`
+  中一个匹配字段；多个字段须同时精确匹配，省略字段视为通配，首条命中
+  规则决定动作，均未命中时允许。规则对象存在缺失或多余字段、非法动作、
+  错误 MAC、布尔值冒充整数、数值越界、空匹配条件或规则数量超限时，在
+  处理任何事件前以 ConfigError（退出码 3，路径 `$.ingress_acl...`）
+  失败，标准输出不写入部分结果。
+  * ACL 仅对已经通过帧合法性、入端口转发状态及 VLAN 入站策略检查的事件
+    求值，并在 MAC 学习、端口安全检查和目的地址查表前执行。`vid` 匹配
+    内部 VLAN：接入口未标记帧使用 `access_vid`，其他未标记帧使用
+    VLAN 1；`pcp` 只能匹配带 802.1Q 标签的帧（未标记帧不命中任何带
+    `pcp` 条件的规则）。
+  * `allow` 沿用既有学习、迁移、静态表优先、泛洪和单播行为；`drop`
+    固定返回 `dropped` 和空 `egress_ports`，不学习或刷新源 MAC，不查
+    目的表，也不产生 `learned`、`refreshed` 或 `moved` 记录。显式事件
+    时钟触发的老化仍先完成，并可产生 `aged` 记录。
+  * 提供 `ingress_acl` 时，每条 results 记录在既有字段后追加
+    `matched_acl_rule`，值为首条命中规则的零基索引；未命中或事件未
+    进入 ACL 求值时为 `null`。ACL 丢弃计入既有端口和 VLAN 入站及丢弃
+    计数，入口镜像仍复制原始帧，出口镜像不交付。省略 `ingress_acl`
+    时输出与此前逐字节一致；每个事件至多顺序检查 4096 条规则，
+    不累积 ACL 状态。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -214,7 +237,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror`、`ingress_acl` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port，或镜像源/目的端口) |
 
@@ -224,7 +247,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 ## 上限
 
 * 端口数量：4096；单个端口 name 长度：64 个字符。
-* `forward` 场景事件数量：10000；静态表项数量：10000。
+* `forward` 场景事件数量：10000；静态表项数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 
 ## 状态

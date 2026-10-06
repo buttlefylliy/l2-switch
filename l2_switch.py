@@ -19,6 +19,7 @@ MAX_FRAME_FILE_BYTES = 131072
 MAX_PAYLOAD_BYTES = 65535
 MAX_EVENTS = 10000
 MAX_STATIC_ENTRIES = 10000
+MAX_ACL_RULES = 4096
 
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
@@ -827,12 +828,157 @@ def validate_egress_mirror(mirror, port_by_name, port_count):
     )
 
 
+# 入口 ACL 规则的字段及其规范顺序；额外字段一律拒绝。
+# action 为必填；src_mac、dst_mac、vid、ether_type、pcp 为可选匹配字段，
+# 至少出现一个，省略的字段视为通配，出现的字段须同时精确匹配。
+ACL_FIELD_ORDER = ("action", "src_mac", "dst_mac", "vid", "ether_type", "pcp")
+ACL_FIELD_SET = frozenset(ACL_FIELD_ORDER)
+ACL_MATCH_FIELD_ORDER = ("src_mac", "dst_mac", "vid", "ether_type", "pcp")
+ACL_ACTIONS = frozenset(("allow", "drop"))
+
+MIN_ACL_VID = 0
+MAX_ACL_VID = 4094
+MIN_ACL_PCP = 0
+MAX_ACL_PCP = 7
+
+
+def _check_acl_action(value, path):
+    if not isinstance(value, str) or value not in ACL_ACTIONS:
+        raise ConfigError("'action' must be 'allow' or 'drop'", path)
+    return value
+
+
+def _check_acl_src_mac(value, path):
+    return _check_acl_mac(value, path, "src_mac")
+
+
+def _check_acl_dst_mac(value, path):
+    return _check_acl_mac(value, path, "dst_mac")
+
+
+def _check_acl_mac(value, path, field):
+    # 匹配字段只做格式校验并规范化为小写；不限制单播/组播/广播。
+    if not isinstance(value, str):
+        raise ConfigError("'%s' must be a string" % field, path)
+    if not MAC_PATTERN.fullmatch(value):
+        raise ConfigError(
+            "'%s' must be six colon-separated two-digit hex octets" % field,
+            path,
+        )
+    return value.lower()
+
+
+def _check_acl_vid(value, path):
+    # vid 匹配内部 VLAN (含带标签帧的 vid 0)；bool 是 int 子类型，须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'vid' must be an integer", path)
+    if value < MIN_ACL_VID or value > MAX_ACL_VID:
+        raise ConfigError(
+            "'vid' must be between %d and %d" % (MIN_ACL_VID, MAX_ACL_VID),
+            path,
+        )
+    return value
+
+
+def _check_acl_ether_type(value, path):
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'ether_type' must be an integer", path)
+    if value < MIN_ETHER_TYPE or value > MAX_ETHER_TYPE:
+        raise ConfigError(
+            "'ether_type' must be between %d and %d"
+            % (MIN_ETHER_TYPE, MAX_ETHER_TYPE),
+            path,
+        )
+    return value
+
+
+def _check_acl_pcp(value, path):
+    # pcp 只匹配带 802.1Q 标签的帧；bool 是 int 子类型，须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'pcp' must be an integer", path)
+    if value < MIN_ACL_PCP or value > MAX_ACL_PCP:
+        raise ConfigError(
+            "'pcp' must be between %d and %d" % (MIN_ACL_PCP, MAX_ACL_PCP),
+            path,
+        )
+    return value
+
+
+ACL_FIELD_CHECKS = {
+    "action": _check_acl_action,
+    "src_mac": _check_acl_src_mac,
+    "dst_mac": _check_acl_dst_mac,
+    "vid": _check_acl_vid,
+    "ether_type": _check_acl_ether_type,
+    "pcp": _check_acl_pcp,
+}
+
+
+def validate_ingress_acl(acl):
+    """校验入口 ACL，返回按输入顺序排列的已校验规则列表。
+
+    每条规则先按输入字段顺序报告首个错误 (未知字段或非法值)，再检查
+    缺失的 action，最后检查至少出现一个匹配字段。规则数量上限为
+    MAX_ACL_RULES。
+    """
+    if not isinstance(acl, list):
+        raise ConfigError("'ingress_acl' must be an array", "$.ingress_acl")
+    if len(acl) > MAX_ACL_RULES:
+        raise ConfigError(
+            "number of acl rules exceeds maximum of %d" % MAX_ACL_RULES,
+            "$.ingress_acl",
+        )
+
+    rules = []
+    for index, item in enumerate(acl):
+        base = "$.ingress_acl[%d]" % index
+        if not isinstance(item, dict):
+            raise ConfigError("acl rule must be an object", base)
+
+        values = {}
+        for field, value in item.items():
+            path = base + "." + field
+            if field not in ACL_FIELD_SET:
+                raise ConfigError("unexpected field '%s'" % field, path)
+            values[field] = ACL_FIELD_CHECKS[field](value, path)
+
+        if "action" not in values:
+            raise ConfigError("missing field 'action'", base + ".action")
+        if not any(field in values for field in ACL_MATCH_FIELD_ORDER):
+            raise ConfigError(
+                "acl rule must specify at least one match field", base
+            )
+        rules.append(values)
+
+    return rules
+
+
+def acl_rule_matches(rule, src_mac, dst_mac, vid, ether_type, pcp):
+    """无状态精确匹配：规则中出现的字段全部相等才命中，省略字段视为通配。
+
+    pcp 只匹配带 802.1Q 标签的帧；未标记帧 (pcp 为 None) 不命中任何
+    带 pcp 条件的规则。
+    """
+    if "src_mac" in rule and rule["src_mac"] != src_mac:
+        return False
+    if "dst_mac" in rule and rule["dst_mac"] != dst_mac:
+        return False
+    if "vid" in rule and rule["vid"] != vid:
+        return False
+    if "ether_type" in rule and rule["ether_type"] != ether_type:
+        return False
+    if "pcp" in rule and (pcp is None or rule["pcp"] != pcp):
+        return False
+    return True
+
+
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
     static_map, include_fdb_events, mirror_sources, mirror_destination,
-    egress_mirror_sources, egress_mirror_destination)：
+    egress_mirror_sources, egress_mirror_destination, acl_rules)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
     "dynamic_mac_limit"} (未配置对应 VLAN 模式或学习上限时为 None)；
@@ -845,7 +991,9 @@ def validate_scenario(scenario):
     mirror_sources 为入口镜像源端口 name 集合，mirror_destination 为镜像
     目的端口 name，未提供 ingress_mirror 时二者均为 None；
     egress_mirror_sources/egress_mirror_destination 对 egress_mirror 同义，
-    未提供 egress_mirror 时二者均为 None。
+    未提供 egress_mirror 时二者均为 None；
+    acl_rules 为按输入顺序排列的已校验入口 ACL 规则列表，
+    未提供 ingress_acl 时为 None。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -879,6 +1027,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "egress_mirror":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
+            seen_fields.add(field)
+        elif field == "ingress_acl":
+            # 记录字段出现；结构校验在 ports 校验完成后进行。
             seen_fields.add(field)
         else:
             raise ConfigError("unexpected field '%s'" % field, path)
@@ -945,6 +1096,11 @@ def validate_scenario(scenario):
             scenario["egress_mirror"], port_by_name, len(port_by_name)
         )
 
+    # 入口 ACL 不引用端口，同样在 ports 之后、events 之前校验。
+    acl_rules = None
+    if "ingress_acl" in seen_fields:
+        acl_rules = validate_ingress_acl(scenario["ingress_acl"])
+
     validated_events = []
     last_time_ms = None
     for index, item in enumerate(events):
@@ -1002,6 +1158,7 @@ def validate_scenario(scenario):
         mirror_destination,
         egress_mirror_sources,
         egress_mirror_destination,
+        acl_rules,
     )
 
 
@@ -1018,9 +1175,11 @@ def run_scenario(scenario):
         mirror_destination,
         egress_mirror_sources,
         egress_mirror_destination,
+        acl_rules,
     ) = validate_scenario(scenario)
     mirror_enabled = mirror_sources is not None
     egress_mirror_enabled = egress_mirror_sources is not None
+    acl_enabled = acl_rules is not None
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -1117,7 +1276,8 @@ def run_scenario(scenario):
         # 接入策略违例，dropped，不学习、不查表、无出口。
         # 中继端口收到未标记帧，或标签 VID 为 0 或不在 trunk_vids 允许数组中：
         # 中继策略违例，dropped，不学习、不查表、无出口。
-        if (
+        # 未通过上述检查的事件不进入 ACL 求值，matched_acl_rule 为 null。
+        pre_acl_ok = not (
             not verdict["valid"]
             or not ingress_attrs["can_forward"]
             or (tagged and access_vid is not None)
@@ -1125,7 +1285,32 @@ def run_scenario(scenario):
                 trunk_vids is not None
                 and (not tagged or vid not in trunk_vids)
             )
-        ):
+        )
+
+        # 入口 ACL 仅对已通过帧合法性、入端口转发状态与 VLAN 入站策略检查的
+        # 事件求值，并在 MAC 学习、端口安全检查与目的查表之前执行；首条命中
+        # 规则决定动作，均未命中时允许。vid 匹配内部 VLAN (接入口未标记帧用
+        # access_vid，其他未标记帧用 VLAN 1)；pcp 只匹配带标签帧。
+        matched_acl_rule = None
+        acl_drop = False
+        if acl_enabled and pre_acl_ok:
+            pcp = verdict["vlan"]["pcp"] if tagged else None
+            for rule_index, rule in enumerate(acl_rules):
+                if acl_rule_matches(
+                    rule, src_mac, dst_mac, vid, verdict["ether_type"], pcp
+                ):
+                    matched_acl_rule = rule_index
+                    break
+            if (
+                matched_acl_rule is not None
+                and acl_rules[matched_acl_rule]["action"] == "drop"
+            ):
+                # ACL 丢弃：固定 dropped 且出口为空；不学习或刷新源 MAC，
+                # 不查目的表，不产生 learned/refreshed/moved 记录；
+                # 仍计入端口与 VLAN 的入站及丢弃计数。
+                acl_drop = True
+
+        if not pre_acl_ok or acl_drop:
             decision = "dropped"
         else:
             # 仅在入端口 can_learn 且该 (VLAN, 规范化源 MAC) 无静态项时才
@@ -1277,6 +1462,10 @@ def run_scenario(scenario):
             # egress_mirror_ports 位于 mirror_ports 之后；未启用入口镜像时
             # 紧随 egress_ports。
             result_record["egress_mirror_ports"] = egress_mirror_ports
+        if acl_enabled:
+            # matched_acl_rule 位于所有既有字段之后：首条命中规则的零基索引；
+            # 未命中或事件未进入 ACL 求值时为 null。
+            result_record["matched_acl_rule"] = matched_acl_rule
         results.append(result_record)
 
         if include_counters:
@@ -1470,10 +1659,18 @@ def build_parser():
             "源端口的事件独立尝试向目的端口再交付一份原始帧副本，泛洪命中"
             "多个源端口也只产生一份，结果在 mirror_ports 之后 (未启用入口"
             "镜像时紧随 egress_ports) 追加 egress_mirror_ports；"
+            "可选 ingress_acl 声明最多 %d 条有序无状态入口过滤规则 "
+            "(action 为 allow 或 drop，至少含 src_mac、dst_mac、vid、"
+            "ether_type、pcp 中一个匹配字段，省略字段视为通配)：仅对已通过"
+            "帧合法性、入端口转发状态与 VLAN 入站策略的事件在学习与查表前"
+            "求值，首条命中决定动作，均未命中时允许，结果在所有既有字段后"
+            "追加 matched_acl_rule (首条命中规则的零基索引或 null)；"
             "无端口模式或跨进程持久化。"
+            % MAX_ACL_RULES
         ),
         epilog=(
-            "限制: 端口数量上限为 %d；事件数量上限为 %d；静态表项数量上限为 %d。"
+            "限制: 端口数量上限为 %d；事件数量上限为 %d；静态表项数量上限为 %d；"
+            "入口 ACL 规则数量上限为 %d。"
             "aging_time_ms 与 time_ms 取值为 1..%d / 0..%d 的整数，"
             "time_ms 按事件顺序单调不减；不读墙上时钟。"
             "泛洪出口按端口 name 的 Unicode 码点升序排列；"
@@ -1482,6 +1679,7 @@ def build_parser():
                 MAX_PORTS,
                 MAX_EVENTS,
                 MAX_STATIC_ENTRIES,
+                MAX_ACL_RULES,
                 MAX_AGING_TIME_MS,
                 MAX_EVENT_TIME_MS,
             )
@@ -1494,7 +1692,8 @@ def build_parser():
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
             "可选 aging_time_ms、static_table、include_counters、"
-            "include_fdb_events、ingress_mirror 与 egress_mirror；每个事件包含 "
+            "include_fdb_events、ingress_mirror、egress_mirror 与 "
+            "ingress_acl；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化时每个事件还需包含 time_ms"
         ),
     )
