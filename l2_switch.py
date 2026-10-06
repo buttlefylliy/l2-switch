@@ -726,11 +726,95 @@ def validate_static_table(static_table, port_by_name):
     return static_map
 
 
+# 入口镜像会话的字段及其规范顺序；额外字段一律拒绝。
+MIRROR_FIELD_ORDER = ("source_ports", "destination_port")
+MIRROR_FIELD_SET = frozenset(MIRROR_FIELD_ORDER)
+MIRROR_BASE = "$.ingress_mirror"
+
+
+def validate_ingress_mirror(mirror, port_by_name, port_count):
+    """校验唯一的入口镜像会话，返回 (源端口 name 集合, 目的端口 name)。
+
+    结构、字段、元素类型、非空、不重复、数量上限以及源/目的重叠均为
+    ConfigError；源或目的名称未引用已配置端口为 StateError。
+    """
+    if not isinstance(mirror, dict):
+        raise ConfigError("'ingress_mirror' must be an object", MIRROR_BASE)
+
+    # 按字段在输入中出现的顺序报告首个错误。
+    values = {}
+    for field, value in mirror.items():
+        path = MIRROR_BASE + "." + field
+        if field not in MIRROR_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        values[field] = value
+
+    for field in MIRROR_FIELD_ORDER:
+        if field not in values:
+            raise ConfigError(
+                "missing field '%s'" % field, MIRROR_BASE + "." + field
+            )
+
+    source_ports = values["source_ports"]
+    source_path = MIRROR_BASE + ".source_ports"
+    if not isinstance(source_ports, list):
+        raise ConfigError("'source_ports' must be an array", source_path)
+    if len(source_ports) == 0:
+        raise ConfigError("'source_ports' must be a non-empty array", source_path)
+    if len(source_ports) > port_count:
+        raise ConfigError(
+            "'source_ports' must not exceed the total number of ports (%d)"
+            % port_count,
+            source_path,
+        )
+
+    sources = []
+    seen = set()
+    for index, item in enumerate(source_ports):
+        item_path = "%s[%d]" % (source_path, index)
+        if not isinstance(item, str):
+            raise ConfigError(
+                "'source_ports' elements must be strings", item_path
+            )
+        if item in seen:
+            raise ConfigError(
+                "'source_ports' must not contain duplicate values", item_path
+            )
+        seen.add(item)
+        sources.append(item)
+
+    destination = values["destination_port"]
+    destination_path = MIRROR_BASE + ".destination_port"
+    if not isinstance(destination, str):
+        raise ConfigError(
+            "'destination_port' must be a string", destination_path
+        )
+    if destination in seen:
+        raise ConfigError(
+            "'destination_port' must not appear in 'source_ports'",
+            destination_path,
+        )
+
+    # 结构全部合法后再检查端口引用 (未知端口归 StateError)。
+    for index, name in enumerate(sources):
+        if name not in port_by_name:
+            raise StateError(
+                "unknown port '%s'" % name, "%s[%d]" % (source_path, index)
+            )
+    if destination not in port_by_name:
+        raise StateError(
+            "unknown port '%s'" % destination, destination_path
+        )
+
+    return seen, destination
+
+
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
-    static_map, include_fdb_events)：port_by_name 将端口 name 映射为
+    static_map, include_fdb_events, mirror_sources, mirror_destination)：
+    port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
     "dynamic_mac_limit"} (未配置对应 VLAN 模式或学习上限时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
@@ -738,7 +822,9 @@ def validate_scenario(scenario):
     include_counters 缺省或为 false 时为 False，输出不含 counters；
     static_map 键为 (vid, 小写 mac)、值为端口 name，未提供 static_table
     或其为空数组时为空映射，输出不含 static_table；
-    include_fdb_events 缺省或为 false 时为 False，输出不含 fdb_events。
+    include_fdb_events 缺省或为 false 时为 False，输出不含 fdb_events；
+    mirror_sources 为入口镜像源端口 name 集合，mirror_destination 为镜像
+    目的端口 name，未提供 ingress_mirror 时二者均为 None。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -765,6 +851,9 @@ def validate_scenario(scenario):
             include_fdb_events = _check_include_fdb_events(value, path)
             seen_fields.add(field)
         elif field == "static_table":
+            # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
+            seen_fields.add(field)
+        elif field == "ingress_mirror":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
             seen_fields.add(field)
         else:
@@ -814,6 +903,14 @@ def validate_scenario(scenario):
     if "static_table" in seen_fields:
         static_map = validate_static_table(
             scenario["static_table"], port_by_name
+        )
+
+    # 入口镜像会话同样在 ports 之后、events 之前校验。
+    mirror_sources = None
+    mirror_destination = None
+    if "ingress_mirror" in seen_fields:
+        mirror_sources, mirror_destination = validate_ingress_mirror(
+            scenario["ingress_mirror"], port_by_name, len(port_by_name)
         )
 
     validated_events = []
@@ -869,6 +966,8 @@ def validate_scenario(scenario):
         include_counters,
         static_map,
         include_fdb_events,
+        mirror_sources,
+        mirror_destination,
     )
 
 
@@ -881,7 +980,10 @@ def run_scenario(scenario):
         include_counters,
         static_map,
         include_fdb_events,
+        mirror_sources,
+        mirror_destination,
     ) = validate_scenario(scenario)
+    mirror_enabled = mirror_sources is not None
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -1092,16 +1194,33 @@ def run_scenario(scenario):
                         if name != ingress and vlan_allows(name, vid)
                     ]
 
-        results.append(
-            {
-                "event": index,
-                "vid": vid,
-                "src_mac": src_mac,
-                "dst_mac": dst_mac,
-                "decision": decision,
-                "egress_ports": egress,
-            }
-        )
+        # 入口镜像独立于普通转发：只要入口属于源端口集合，就尝试向镜像目的
+        # 端口交付一份原始入口副本，即使该帧已因 runt/oversize/bad_fcs、入口
+        # 状态、VLAN 策略或端口安全而被丢弃。交付仅取决于目的端口 can_forward，
+        # 其 access_vid/trunk_vids 不限制这份副本；镜像不触发学习、刷新、迁移、
+        # 老化或计数，也不改变 decision、egress_ports 与转发表。每个事件最多
+        # 一份副本。未配置镜像会话时不输出 mirror_ports 键。
+        if mirror_enabled:
+            if (
+                ingress in mirror_sources
+                and port_by_name[mirror_destination]["can_forward"]
+            ):
+                mirror_ports = [mirror_destination]
+            else:
+                mirror_ports = []
+
+        result_record = {
+            "event": index,
+            "vid": vid,
+            "src_mac": src_mac,
+            "dst_mac": dst_mac,
+            "decision": decision,
+            "egress_ports": egress,
+        }
+        if mirror_enabled:
+            # mirror_ports 紧随 egress_ports 之后。
+            result_record["mirror_ports"] = mirror_ports
+        results.append(result_record)
 
         if include_counters:
             # 入口计数覆盖全部事件 (含随后丢弃的)；丢弃只计 decision 为
@@ -1286,6 +1405,9 @@ def build_parser():
             "端口与 VLAN 帧计数；"
             "可选 include_fdb_events 为 true 时在所有既有区段之后追加 fdb_events，"
             "按事件顺序记录实际提交的动态表变化 (aged/learned/refreshed/moved)；"
+            "可选 ingress_mirror 声明唯一一个入口镜像会话 (source_ports 与 "
+            "destination_port)：入口属于源端口的事件都独立尝试向目的端口交付"
+            "一份入口帧副本，结果在 egress_ports 后追加 mirror_ports；"
             "无端口模式或跨进程持久化。"
         ),
         epilog=(
@@ -1309,8 +1431,8 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
-            "可选 aging_time_ms、static_table、include_counters 与 "
-            "include_fdb_events；每个事件包含 "
+            "可选 aging_time_ms、static_table、include_counters、"
+            "include_fdb_events 与 ingress_mirror；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化时每个事件还需包含 time_ms"
         ),
     )

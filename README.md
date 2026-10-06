@@ -99,7 +99,8 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   时间仍触发到期清理，但不新建或刷新表项。刷新时间取学习/迁移事件的
   `time_ms`；不同 VLAN 的同名 MAC 独立老化。处理不按时间跨度循环推进。
 * 输出为单行固定键序 JSON：版本标识、与输入一一对应的结果
-  (event、vid、src_mac、dst_mac、decision、egress_ports) 以及最终动态表快照
+  (event、vid、src_mac、dst_mac、decision、egress_ports；提供
+  `ingress_mirror` 时在 egress_ports 后追加 mirror_ports) 以及最终动态表快照
   (按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序；仅含最后事件时刻仍有效
   的表项)。
 * 场景可选顶层 `include_counters`（布尔）：为 true 时在 `dynamic_table` 后
@@ -151,6 +152,29 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     空事件或没有变化时为空数组；记录总数不超过事件数的两倍。
   * 该审计开关不改变学习、转发、计数或最终表状态；相同场景的记录内容、
     顺序与整行 JSON 逐字节一致。
+* 场景可选顶层 `ingress_mirror` 对象声明唯一一个入口镜像会话，仅含
+  `source_ports` 与 `destination_port` 两个字段（额外字段一律拒绝）：
+  `source_ports` 为已配置端口名组成的非空、不重复数组，且元素个数不得超过
+  已配置端口总数；`destination_port` 为另一个已配置端口，且不得出现在
+  `source_ports` 中。仅支持一个入口镜像会话。结构错误、字段缺失或多余、
+  `source_ports` 为空或超过端口总数、元素非字符串或重复，以及目的端口同时
+  属于源端口时，在处理任何事件前以 ConfigError（退出码 3，路径
+  `$.ingress_mirror...`）失败；源或目的名称未引用现有端口时以 StateError
+  （退出码 5，路径 `$.ingress_mirror.source_ports[i]` 或
+  `$.ingress_mirror.destination_port`）失败。失败时标准输出不写入部分结果。
+  * 完整场景校验成功后，凡 `ingress_port` 属于 `source_ports` 的事件，都
+    独立尝试向 `destination_port` 交付一份入口帧副本；即使原帧因 runt、
+    oversize、bad_fcs、入口端口状态、VLAN 策略或端口安全而被丢弃，也仍
+    尝试镜像。仅当目的端口 `can_forward` 为真时交付；目的端口的
+    `access_vid` 或 `trunk_vids` 不限制这份原始入口副本。
+  * 镜像不触发额外学习、刷新、迁移或老化，不改变 decision、egress_ports、
+    动态表、static_table、fdb_events 与 VLAN/端口计数；每个事件最多产生一个
+    镜像副本，`include_counters` 的 egress_frames 只统计普通转发，不统计
+    镜像副本。
+  * 提供 `ingress_mirror` 时，每条 results 记录在 `egress_ports` 之后追加
+    `mirror_ports`：成功交付时为仅含 `destination_port` 的数组，否则为空数组
+    （入口不属于源端口，或目的端口不可转发）。省略 `ingress_mirror` 时，
+    现有校验、输出键序及逐字节结果保持不变。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -159,9 +183,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port 或静态项 port) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port，或镜像源/目的端口) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
