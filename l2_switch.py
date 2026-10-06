@@ -3,7 +3,8 @@
 
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
-以及场景内的动态 MAC 学习、查表与转发 (forward 子命令)。
+以及场景内的动态 MAC 学习、查表、转发与可选的事件时钟驱动老化
+(forward 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -18,6 +19,11 @@ MAX_PORT_NAME_LEN = 64
 MAX_FRAME_FILE_BYTES = 131072
 MAX_PAYLOAD_BYTES = 65535
 MAX_EVENTS = 10000
+
+# 事件时钟与老化期限的取值范围 (有符号 64 位非负/正整数)。
+MAX_TIME_MS = 9223372036854775807
+MIN_AGING_TIME_MS = 1
+MAX_AGING_TIME_MS = 9223372036854775807
 
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
@@ -490,6 +496,30 @@ EVENT_FIELD_ORDER = ("ingress_port", "frame")
 EVENT_FIELD_SET = frozenset(EVENT_FIELD_ORDER)
 
 
+def _check_aging_time_ms(value, path):
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'aging_time_ms' must be an integer", path)
+    if value < MIN_AGING_TIME_MS or value > MAX_AGING_TIME_MS:
+        raise ConfigError(
+            "'aging_time_ms' must be between %d and %d"
+            % (MIN_AGING_TIME_MS, MAX_AGING_TIME_MS),
+            path,
+        )
+    return value
+
+
+def _check_time_ms(value, path):
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise FrameError("'time_ms' must be an integer", path)
+    if value < 0 or value > MAX_TIME_MS:
+        raise FrameError(
+            "'time_ms' must be between 0 and %d" % MAX_TIME_MS, path
+        )
+    return value
+
+
 def read_scenario(path):
     """读取并解析 UTF-8 JSON 场景；读取/解码/解析失败抛 ValueError。"""
     try:
@@ -512,19 +542,23 @@ def read_scenario(path):
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
-    返回 (port_by_name, validated_events)：
+    返回 (port_by_name, validated_events, aging_time_ms)：
     port_by_name 将端口 name 映射为 {"can_forward", "can_learn"}；
-    validated_events 每项为 (ingress_name, 帧判定结果)。
+    validated_events 每项为 (ingress_name, 帧判定结果, time_ms)；
+    aging_time_ms 为 None 表示未启用老化，此时 time_ms 一律为 None。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
 
     # 按顶层键在输入中出现的顺序报告首个错误；遍历后再按规范顺序报告缺失字段。
+    aging_time_ms = None
     seen_fields = set()
     for field, value in scenario.items():
         path = "$." + field
-        if field not in ("ports", "events"):
+        if field not in ("ports", "events", "aging_time_ms"):
             raise ConfigError("unexpected field '%s'" % field, path)
+        if field == "aging_time_ms":
+            aging_time_ms = _check_aging_time_ms(value, path)
         seen_fields.add(field)
 
     if "ports" not in seen_fields:
@@ -559,15 +593,20 @@ def validate_scenario(scenario):
         }
 
     validated_events = []
+    previous_time_ms = None
     for index, item in enumerate(events):
         base = "$.events[%d]" % index
         if not isinstance(item, dict):
             raise FrameError("event must be an object", base)
 
+        # 未启用老化时 time_ms 是孤立字段，按意外字段拒绝。
+        allowed = EVENT_FIELD_SET | (
+            {"time_ms"} if aging_time_ms is not None else set()
+        )
         values = {}
         for field, value in item.items():
             path = base + "." + field
-            if field not in EVENT_FIELD_SET:
+            if field not in allowed:
                 raise FrameError("unexpected field '%s'" % field, path)
             values[field] = value
 
@@ -576,6 +615,21 @@ def validate_scenario(scenario):
                 raise FrameError(
                     "missing field '%s'" % field, base + "." + field
                 )
+
+        time_ms = None
+        if aging_time_ms is not None:
+            if "time_ms" not in values:
+                raise FrameError(
+                    "missing field 'time_ms'", base + ".time_ms"
+                )
+            time_ms = _check_time_ms(values["time_ms"], base + ".time_ms")
+            # 事件时钟按事件顺序单调不减。
+            if previous_time_ms is not None and time_ms < previous_time_ms:
+                raise FrameError(
+                    "'time_ms' must be non-decreasing across events",
+                    base + ".time_ms",
+                )
+            previous_time_ms = time_ms
 
         ingress = values["ingress_port"]
         if not isinstance(ingress, str):
@@ -587,14 +641,14 @@ def validate_scenario(scenario):
             )
 
         verdict = evaluate_frame(values["frame"], base + ".frame")
-        validated_events.append((ingress, verdict))
+        validated_events.append((ingress, verdict, time_ms))
 
-    return port_by_name, validated_events
+    return port_by_name, validated_events, aging_time_ms
 
 
 def run_scenario(scenario):
     """校验并按顺序处理场景，返回固定键序的结果对象。"""
-    port_by_name, events = validate_scenario(scenario)
+    port_by_name, events, aging_time_ms = validate_scenario(scenario)
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -603,15 +657,28 @@ def run_scenario(scenario):
         if attrs["can_forward"]
     )
 
-    # 动态表：键为 (vid, 小写单播源 MAC)，值为学习到的端口 name。
+    # 动态表：键为 (vid, 小写单播源 MAC)，值为 (学习到的端口 name, 最后刷新时间)。
+    # 未启用老化时刷新时间恒为 None，不参与任何判定。
     table = {}
     results = []
 
-    for index, (ingress, verdict) in enumerate(events):
+    for index, (ingress, verdict, time_ms) in enumerate(events):
         vid = verdict["vlan"]["vid"] if verdict["vlan"] is not None else UNTAGGED_VID
         src_mac = verdict["src_mac"]
         dst_mac = verdict["dst_mac"]
         ingress_attrs = port_by_name[ingress]
+
+        # 启用老化时，事件时钟到达后先按 (当前时间 - 最后刷新时间) >= aging_time_ms
+        # 删除到期表项，再处理该帧；恰好达到期限的表项同样失效。
+        # 到期清理由每个事件的时间触发，与帧是否合法、入端口是否可转发无关。
+        if aging_time_ms is not None:
+            expired = [
+                key
+                for key, (_, refreshed_ms) in table.items()
+                if time_ms - refreshed_ms >= aging_time_ms
+            ]
+            for key in expired:
+                del table[key]
 
         egress = []
         # runt、oversize 或 bad_fcs：一律 dropped，不学习、不查表、无出口。
@@ -620,9 +687,9 @@ def run_scenario(scenario):
             decision = "dropped"
         else:
             # 仅在入端口 can_learn 时按 (VLAN, 规范化源 MAC) 学习；
-            # 同一键从另一端口出现时迁移到新端口。
+            # 同一键从另一端口出现时迁移到新端口，并刷新该键的时间。
             if ingress_attrs["can_learn"]:
-                table[(vid, src_mac)] = ingress
+                table[(vid, src_mac)] = (ingress, time_ms)
 
             if verdict["destination_type"] == "unicast":
                 hit = table.get((vid, dst_mac))
@@ -630,13 +697,13 @@ def run_scenario(scenario):
                     # 未命中单播泛洪。
                     decision = "flooded"
                     egress = [name for name in flood_ports if name != ingress]
-                elif hit == ingress:
+                elif hit[0] == ingress:
                     # 命中入端口：过滤，出口为空。
                     decision = "filtered"
                 else:
                     # 命中单播仅发往表项端口。
                     decision = "forwarded"
-                    egress = [hit]
+                    egress = [hit[0]]
             else:
                 # 广播与组播泛洪到除入端口外所有 can_forward 端口。
                 decision = "flooded"
@@ -654,9 +721,10 @@ def run_scenario(scenario):
         )
 
     # 表项按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序排列。
+    # 启用老化时，最后事件的到期清理已保证只剩该时刻仍有效的表项。
     entries = [
         {"vid": vid, "mac": mac, "port": port}
-        for (vid, mac), port in sorted(table.items(), key=lambda kv: kv[0])
+        for (vid, mac), (port, _) in sorted(table.items(), key=lambda kv: kv[0])
     ]
 
     return {
@@ -760,7 +828,9 @@ def build_parser():
             "先完整校验，再按事件顺序执行场景内动态 MAC 表的学习、查表与转发，"
             "并向标准输出写入单行 JSON 结果。"
             "未标记帧归入 VLAN 1，带标签帧按 vid 隔离，vid 0 也作为独立域。"
-            "不含静态表项、老化、端口模式、计数或跨进程持久化。"
+            "可选 aging_time_ms 启用由事件 time_ms 时钟驱动的动态表项老化；"
+            "不提供时行为与旧格式场景一致。"
+            "不含静态表项、端口模式、计数或跨进程持久化。"
         ),
         epilog=(
             "限制: 端口数量上限为 %d；事件数量上限为 %d。"
@@ -775,7 +845,8 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组；"
-            "每个事件包含 ingress_port 与完整 frame 描述"
+            "每个事件包含 ingress_port 与完整 frame 描述；"
+            "可选 aging_time_ms 启用老化，启用后每个事件还须携带 time_ms"
         ),
     )
     forward_parser.set_defaults(func=cmd_forward)
