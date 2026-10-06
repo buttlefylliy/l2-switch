@@ -831,10 +831,19 @@ def validate_egress_mirror(mirror, port_by_name, port_count):
 # 入口 ACL 规则的字段及其规范顺序；额外字段一律拒绝。
 # action 为必填；src_mac、dst_mac、vid、ether_type、pcp 为可选匹配字段，
 # 至少出现一个，省略的字段视为通配，出现的字段须同时精确匹配。
-ACL_FIELD_ORDER = ("action", "src_mac", "dst_mac", "vid", "ether_type", "pcp")
+# set_pcp 仅允许出现在 action 为 remark_pcp 的规则中，给出重标记后的 PCP。
+ACL_FIELD_ORDER = (
+    "action",
+    "src_mac",
+    "dst_mac",
+    "vid",
+    "ether_type",
+    "pcp",
+    "set_pcp",
+)
 ACL_FIELD_SET = frozenset(ACL_FIELD_ORDER)
 ACL_MATCH_FIELD_ORDER = ("src_mac", "dst_mac", "vid", "ether_type", "pcp")
-ACL_ACTIONS = frozenset(("allow", "drop"))
+ACL_ACTIONS = frozenset(("allow", "drop", "remark_pcp"))
 
 MIN_ACL_VID = 0
 MAX_ACL_VID = 4094
@@ -844,7 +853,9 @@ MAX_ACL_PCP = 7
 
 def _check_acl_action(value, path):
     if not isinstance(value, str) or value not in ACL_ACTIONS:
-        raise ConfigError("'action' must be 'allow' or 'drop'", path)
+        raise ConfigError(
+            "'action' must be 'allow', 'drop' or 'remark_pcp'", path
+        )
     return value
 
 
@@ -905,6 +916,19 @@ def _check_acl_pcp(value, path):
     return value
 
 
+def _check_acl_set_pcp(value, path):
+    # set_pcp 为 remark_pcp 规则重标记后的确定 PCP；bool 是 int 子类型，
+    # 须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'set_pcp' must be an integer", path)
+    if value < MIN_ACL_PCP or value > MAX_ACL_PCP:
+        raise ConfigError(
+            "'set_pcp' must be between %d and %d" % (MIN_ACL_PCP, MAX_ACL_PCP),
+            path,
+        )
+    return value
+
+
 ACL_FIELD_CHECKS = {
     "action": _check_acl_action,
     "src_mac": _check_acl_src_mac,
@@ -912,6 +936,7 @@ ACL_FIELD_CHECKS = {
     "vid": _check_acl_vid,
     "ether_type": _check_acl_ether_type,
     "pcp": _check_acl_pcp,
+    "set_pcp": _check_acl_set_pcp,
 }
 
 
@@ -919,8 +944,10 @@ def validate_ingress_acl(acl):
     """校验入口 ACL，返回按输入顺序排列的已校验规则列表。
 
     每条规则先按输入字段顺序报告首个错误 (未知字段或非法值)，再检查
-    缺失的 action，最后检查至少出现一个匹配字段。规则数量上限为
-    MAX_ACL_RULES。
+    缺失的 action，然后按动作检查 set_pcp 与匹配字段的组合约束：
+    remark_pcp 规则必须含 set_pcp 与 pcp 匹配字段 (pcp 保证只命中带
+    802.1Q 标签的帧)，allow、drop 规则不得携带 set_pcp 且至少含一个
+    匹配字段。规则数量上限为 MAX_ACL_RULES。
     """
     if not isinstance(acl, list):
         raise ConfigError("'ingress_acl' must be an array", "$.ingress_acl")
@@ -945,10 +972,24 @@ def validate_ingress_acl(acl):
 
         if "action" not in values:
             raise ConfigError("missing field 'action'", base + ".action")
-        if not any(field in values for field in ACL_MATCH_FIELD_ORDER):
-            raise ConfigError(
-                "acl rule must specify at least one match field", base
-            )
+        if values["action"] == "remark_pcp":
+            if "set_pcp" not in values:
+                raise ConfigError("missing field 'set_pcp'", base + ".set_pcp")
+            if "pcp" not in values:
+                raise ConfigError(
+                    "remark_pcp rule must specify match field 'pcp'",
+                    base + ".pcp",
+                )
+        else:
+            if "set_pcp" in values:
+                raise ConfigError(
+                    "'set_pcp' is only allowed with action 'remark_pcp'",
+                    base + ".set_pcp",
+                )
+            if not any(field in values for field in ACL_MATCH_FIELD_ORDER):
+                raise ConfigError(
+                    "acl rule must specify at least one match field", base
+                )
         rules.append(values)
 
     return rules
@@ -1291,8 +1332,13 @@ def run_scenario(scenario):
         # 事件求值，并在 MAC 学习、端口安全检查与目的查表之前执行；首条命中
         # 规则决定动作，均未命中时允许。vid 匹配内部 VLAN (接入口未标记帧用
         # access_vid，其他未标记帧用 VLAN 1)；pcp 只匹配带标签帧。
+        # remark_pcp 命中时把该帧的 PCP 重标记为规则的 set_pcp：不改变内部
+        # VLAN，不重新执行 ACL，学习、查表、泛洪与计数沿既有路径执行，只有
+        # 普通出口帧及由它触发的出口镜像副本使用新 PCP，入口镜像仍复制
+        # 重标记前的原始帧。
         matched_acl_rule = None
         acl_drop = False
+        remarked_pcp = None
         if acl_enabled and pre_acl_ok:
             pcp = verdict["vlan"]["pcp"] if tagged else None
             for rule_index, rule in enumerate(acl_rules):
@@ -1301,14 +1347,16 @@ def run_scenario(scenario):
                 ):
                     matched_acl_rule = rule_index
                     break
-            if (
-                matched_acl_rule is not None
-                and acl_rules[matched_acl_rule]["action"] == "drop"
-            ):
-                # ACL 丢弃：固定 dropped 且出口为空；不学习或刷新源 MAC，
-                # 不查目的表，不产生 learned/refreshed/moved 记录；
-                # 仍计入端口与 VLAN 的入站及丢弃计数。
-                acl_drop = True
+            if matched_acl_rule is not None:
+                matched_action = acl_rules[matched_acl_rule]["action"]
+                if matched_action == "drop":
+                    # ACL 丢弃：固定 dropped 且出口为空；不学习或刷新源 MAC，
+                    # 不查目的表，不产生 learned/refreshed/moved 记录；
+                    # 仍计入端口与 VLAN 的入站及丢弃计数。
+                    acl_drop = True
+                elif matched_action == "remark_pcp":
+                    # remark_pcp 规则必含 pcp 匹配字段，故只命中带标签帧。
+                    remarked_pcp = acl_rules[matched_acl_rule]["set_pcp"]
 
         if not pre_acl_ok or acl_drop:
             decision = "dropped"
@@ -1464,8 +1512,20 @@ def run_scenario(scenario):
             result_record["egress_mirror_ports"] = egress_mirror_ports
         if acl_enabled:
             # matched_acl_rule 位于所有既有字段之后：首条命中规则的零基索引；
-            # 未命中或事件未进入 ACL 求值时为 null。
+            # 未命中或事件未进入 ACL 求值时为 null。effective_pcp 紧随其后：
+            # 带标签帧为最终 PCP (命中 remark_pcp 时为重标记值，未进入 ACL
+            # 求值或未命中重标记规则时为原始 PCP，丢弃路径同样确定)，
+            # 未标记帧为 null。
             result_record["matched_acl_rule"] = matched_acl_rule
+            if tagged:
+                effective_pcp = (
+                    remarked_pcp
+                    if remarked_pcp is not None
+                    else verdict["vlan"]["pcp"]
+                )
+            else:
+                effective_pcp = None
+            result_record["effective_pcp"] = effective_pcp
         results.append(result_record)
 
         if include_counters:
@@ -1660,11 +1720,17 @@ def build_parser():
             "多个源端口也只产生一份，结果在 mirror_ports 之后 (未启用入口"
             "镜像时紧随 egress_ports) 追加 egress_mirror_ports；"
             "可选 ingress_acl 声明最多 %d 条有序无状态入口过滤规则 "
-            "(action 为 allow 或 drop，至少含 src_mac、dst_mac、vid、"
-            "ether_type、pcp 中一个匹配字段，省略字段视为通配)：仅对已通过"
+            "(action 为 allow、drop 或 remark_pcp，至少含 src_mac、"
+            "dst_mac、vid、ether_type、pcp 中一个匹配字段，省略字段视为"
+            "通配；remark_pcp 规则必须含 pcp 匹配字段与 0..7 的 set_pcp，"
+            "set_pcp 不允许出现在 allow、drop 规则中)：仅对已通过"
             "帧合法性、入端口转发状态与 VLAN 入站策略的事件在学习与查表前"
-            "求值，首条命中决定动作，均未命中时允许，结果在所有既有字段后"
-            "追加 matched_acl_rule (首条命中规则的零基索引或 null)；"
+            "求值，首条命中决定动作，均未命中时允许；remark_pcp 命中时把"
+            "带标签帧的 PCP 重标记为 set_pcp，学习、查表、泛洪与计数沿"
+            "既有路径执行，仅普通出口帧及其出口镜像副本使用新 PCP，"
+            "入口镜像仍复制原始帧。结果在所有既有字段后"
+            "追加 matched_acl_rule (首条命中规则的零基索引或 null) 与 "
+            "effective_pcp (带标签帧的最终 PCP，未标记帧为 null)；"
             "无端口模式或跨进程持久化。"
             % MAX_ACL_RULES
         ),
