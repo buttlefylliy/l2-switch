@@ -3,7 +3,7 @@
 
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
-以及场景内的动态 MAC 学习、查表与转发 (forward 子命令)。
+以及场景内的静态表项、动态 MAC 学习、查表与转发 (forward 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -489,6 +489,13 @@ def cmd_frame(args):
 EVENT_FIELD_ORDER = ("ingress_port", "frame", "time_ms")
 EVENT_FIELD_SET = frozenset(EVENT_FIELD_ORDER)
 
+# 静态表项只含 vid、mac、port；额外字段一律拒绝。
+STATIC_FIELD_ORDER = ("vid", "mac", "port")
+STATIC_FIELD_SET = frozenset(STATIC_FIELD_ORDER)
+MAX_STATIC_ENTRIES = 10000
+MIN_STATIC_VID = 0
+MAX_STATIC_VID = 4094
+
 # 老化时钟的显式范围；bool 是 int 子类型，校验时必须显式排除。
 MIN_AGING_TIME_MS = 1
 MAX_AGING_TIME_MS = 9223372036854775807
@@ -548,14 +555,98 @@ def _check_event_time_ms(value, path):
     return value
 
 
+def _check_static_vid(value, path):
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'vid' must be an integer", path)
+    if value < MIN_STATIC_VID or value > MAX_STATIC_VID:
+        raise ConfigError(
+            "'vid' must be between %d and %d" % (MIN_STATIC_VID, MAX_STATIC_VID),
+            path,
+        )
+    return value
+
+
+def _check_static_mac(value, path):
+    if not isinstance(value, str):
+        raise ConfigError("'mac' must be a string", path)
+    if not MAC_PATTERN.fullmatch(value):
+        raise ConfigError(
+            "'mac' must be six colon-separated two-digit hex octets", path
+        )
+    # 表内统一小写。
+    mac = value.lower()
+    if mac == ZERO_MAC:
+        raise ConfigError("'mac' must be non-zero", path)
+    if int(mac.split(":")[0], 16) & 1:
+        raise ConfigError("'mac' must be a unicast address", path)
+    return mac
+
+
+def _check_static_port(value, path):
+    if not isinstance(value, str):
+        raise ConfigError("'port' must be a string", path)
+    return value
+
+
+STATIC_FIELD_CHECKS = {
+    "vid": _check_static_vid,
+    "mac": _check_static_mac,
+    "port": _check_static_port,
+}
+
+
+def validate_static_entry(item, index, seen_keys, port_by_name):
+    """校验单个静态表项，返回 (vid, 小写 mac, port name)。
+
+    按字段在输入中出现的顺序报告首个错误 (未知字段或非法值立即报告)；
+    仅当所有出现字段均合法后，才按规范字段顺序报告首个缺失字段，
+    随后报告重复 (vid, mac) 组合与不存在的端口引用。
+    """
+    base = "$.static_table[%d]" % index
+
+    if not isinstance(item, dict):
+        raise ConfigError("static entry must be an object", base)
+
+    values = {}
+    for field, value in item.items():
+        path = base + "." + field
+        if field not in STATIC_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        values[field] = STATIC_FIELD_CHECKS[field](value, path)
+
+    for field in STATIC_FIELD_ORDER:
+        if field not in values:
+            raise ConfigError("missing field '%s'" % field, base + "." + field)
+
+    key = (values["vid"], values["mac"])
+    if key in seen_keys:
+        raise ConfigError(
+            "duplicate static entry for vid %d and mac '%s'" % key,
+            base + ".mac",
+        )
+    seen_keys.add(key)
+
+    # 未知端口引用在全部结构校验完成后仍属于处理前引用检查。
+    if values["port"] not in port_by_name:
+        raise StateError(
+            "unknown port '%s'" % values["port"], base + ".port"
+        )
+
+    return key[0], key[1], values["port"]
+
+
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
-    返回 (port_by_name, validated_events, aging_time_ms, include_counters)：
+    返回 (port_by_name, validated_events, aging_time_ms, include_counters,
+    static_entries)：
     port_by_name 将端口 name 映射为 {"can_forward", "can_learn"}；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
-    include_counters 缺省或为 false 时为 False，输出不含 counters。
+    include_counters 缺省或为 false 时为 False，输出不含 counters；
+    static_entries 为 (vid, 小写 mac, port name) 列表，未提供 static_table
+    或为空数组时为 None 或空列表，均不触发表行为与输出变化。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -576,6 +667,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "include_counters":
             include_counters = _check_include_counters(value, path)
+            seen_fields.add(field)
+        elif field == "static_table":
+            # 静态表项在端口校验之后统一校验 (需要端口名集合)。
             seen_fields.add(field)
         else:
             raise ConfigError("unexpected field '%s'" % field, path)
@@ -610,6 +704,25 @@ def validate_scenario(scenario):
             "can_forward": can_forward,
             "can_learn": can_learn,
         }
+
+    # 静态表项在事件之前校验：任何静态表错误都先于首个事件的处理暴露。
+    static_entries = None
+    if "static_table" in seen_fields:
+        raw_static = scenario["static_table"]
+        if not isinstance(raw_static, list):
+            raise ConfigError("'static_table' must be an array", "$.static_table")
+        if len(raw_static) > MAX_STATIC_ENTRIES:
+            raise ConfigError(
+                "number of static entries exceeds maximum of %d"
+                % MAX_STATIC_ENTRIES,
+                "$.static_table",
+            )
+        static_entries = []
+        seen_keys = set()
+        for index, item in enumerate(raw_static):
+            static_entries.append(
+                validate_static_entry(item, index, seen_keys, port_by_name)
+            )
 
     validated_events = []
     last_time_ms = None
@@ -657,14 +770,27 @@ def validate_scenario(scenario):
         event_time = values["time_ms"] if aging_time_ms is not None else None
         validated_events.append((ingress, verdict, event_time))
 
-    return port_by_name, validated_events, aging_time_ms, include_counters
+    return (
+        port_by_name,
+        validated_events,
+        aging_time_ms,
+        include_counters,
+        static_entries,
+    )
 
 
 def run_scenario(scenario):
     """校验并按顺序处理场景，返回固定键序的结果对象。"""
-    port_by_name, events, aging_time_ms, include_counters = validate_scenario(
-        scenario
+    port_by_name, events, aging_time_ms, include_counters, static_entries = (
+        validate_scenario(scenario)
     )
+
+    # 静态表：键为 (vid, 小写单播 MAC)，从场景开始到结束始终有效，
+    # 不老化，也不被学习、刷新或迁移覆盖；空表与省略等价。
+    static_table = {}
+    if static_entries:
+        for vid, mac, port in static_entries:
+            static_table[(vid, mac)] = port
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -715,12 +841,27 @@ def run_scenario(scenario):
         else:
             # 仅在入端口 can_learn 时按 (VLAN, 规范化源 MAC) 学习/刷新；
             # 同一键从另一端口出现时迁移到新端口，同时刷新时间。
-            if ingress_attrs["can_learn"]:
+            # 同 VLAN 已有静态项的键不创建也不更新动态项。
+            if ingress_attrs["can_learn"] and (vid, src_mac) not in static_table:
                 table[(vid, src_mac)] = (ingress, time_ms)
 
             if verdict["destination_type"] == "unicast":
-                hit_entry = table.get((vid, dst_mac))
-                if hit_entry is None:
+                # 静态项优先于动态表。
+                static_port = static_table.get((vid, dst_mac))
+                hit_entry = (
+                    None if static_port is not None else table.get((vid, dst_mac))
+                )
+                if static_port is not None:
+                    # 命中静态项：只发往表项端口；命中入端口过滤，目标端口
+                    # 不可转发时丢弃，均不按未知单播泛洪。
+                    if static_port == ingress:
+                        decision = "filtered"
+                    elif not port_by_name[static_port]["can_forward"]:
+                        decision = "dropped"
+                    else:
+                        decision = "forwarded"
+                        egress = [static_port]
+                elif hit_entry is None:
                     # 未命中单播泛洪。
                     decision = "flooded"
                     egress = [name for name in flood_ports if name != ingress]
@@ -776,6 +917,14 @@ def run_scenario(scenario):
         "results": results,
         "dynamic_table": entries,
     }
+
+    if static_entries:
+        # 静态项从场景开始到结束不变；按 vid 数值升序、再按 mac 码点升序
+        # ((vid, mac) 唯一，port 不参与比较)。
+        output["static_table"] = [
+            {"vid": vid, "mac": mac, "port": port}
+            for vid, mac, port in sorted(static_entries)
+        ]
 
     if include_counters:
         # 端口项按 name 的 Unicode 码点升序 (port_stats 已按此序构建)，
@@ -898,12 +1047,15 @@ def build_parser():
             "先完整校验，再按事件顺序执行场景内动态 MAC 表的学习、查表与转发，"
             "并向标准输出写入单行 JSON 结果。"
             "未标记帧归入 VLAN 1，带标签帧按 vid 隔离，vid 0 也作为独立域。"
-            "场景可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
+            "场景可选 static_table 提供从始至终有效的静态单播表项，"
+            "查表时优先于动态表且不参与老化与学习覆盖；"
+            "可选 aging_time_ms 启用由事件 time_ms 驱动的动态表项老化；"
             "可选 include_counters 为 true 时在 dynamic_table 后追加本次场景的"
-            "端口与 VLAN 帧计数；不含静态表项、端口模式或跨进程持久化。"
+            "端口与 VLAN 帧计数；不含端口模式或跨进程持久化。"
         ),
         epilog=(
-            "限制: 端口数量上限为 %d；事件数量上限为 %d。"
+            "限制: 端口数量上限为 %d；事件数量上限为 %d；"
+            "静态表项数量上限为 %d。"
             "aging_time_ms 与 time_ms 取值为 1..%d / 0..%d 的整数，"
             "time_ms 按事件顺序单调不减；不读墙上时钟。"
             "泛洪出口按端口 name 的 Unicode 码点升序排列；"
@@ -911,6 +1063,7 @@ def build_parser():
             % (
                 MAX_PORTS,
                 MAX_EVENTS,
+                MAX_STATIC_ENTRIES,
                 MAX_AGING_TIME_MS,
                 MAX_EVENT_TIME_MS,
             )
@@ -922,7 +1075,8 @@ def build_parser():
         metavar="FILE",
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
-            "可选 aging_time_ms 与 include_counters；每个事件包含 ingress_port "
+            "可选 static_table、aging_time_ms 与 include_counters；"
+            "每个事件包含 ingress_port "
             "与完整 frame 描述，启用老化时每个事件还需包含 time_ms"
         ),
     )
