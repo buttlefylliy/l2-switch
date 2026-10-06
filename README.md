@@ -242,6 +242,29 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     `null`。ACL 丢弃计入既有端口和 VLAN 入站及丢弃计数，入口镜像仍复制原始帧
     （重标记前），出口镜像不交付。省略 `ingress_acl` 时输出与此前逐字节
     一致；仅使用原有 `allow`、`drop` 规则时转发决定、学习结果和审计内容不变。
+* 场景可选顶层 `mac_bindings` 数组（最多 10000 项）声明 VLAN 感知的源 MAC
+  静态绑定，阻止受保护地址从错误端口冒用；每项仅含 `vid`、`mac`、`port`：
+  `vid` 为 0 到 4094 的整数，`mac` 为非零单播 MAC 地址（规范化为小写），
+  `port` 引用 `ports` 中的端口名；同一 (vid, 规范化 mac) 组合只能出现一次。
+  `mac_bindings` 不是数组、字段缺失或多余、`vid` 或 `mac` 非法、组合重复或
+  超限时，在处理任何事件前以 ConfigError（退出码 3，路径
+  `$.mac_bindings...`）失败；`port` 不是字符串同样为 ConfigError，
+  名称未引用现有端口时以 StateError（退出码 5，路径
+  `$.mac_bindings[i].port`）失败。失败时标准输出不写入部分结果。
+  * 绑定只校验源地址，不参与目的地址查表，可与 `static_table` 同键共存；
+    绑定不创建转发表项，也不占动态学习额度。完整场景校验成功后，仅对已通过
+    帧合法性、入端口转发状态和 VLAN 入站策略的事件，在入口 ACL、
+    `dynamic_mac_limit`、MAC 学习和目的查表前，按（内部 VLAN, 规范化源
+    MAC）查询绑定（每个事件最多一次）。未绑定或来自绑定端口的源地址继续
+    既有流程。
+  * 绑定端口与 `ingress_port` 不同即冒用：本事件固定返回 `dropped` 和空
+    `egress_ports`，不求值 ACL（`matched_acl_rule` 为 `null`），不学习、
+    刷新或迁移源 MAC，也不查询目的地址；事件时钟触发的老化仍先执行并可
+    产生 `aged` 记录。该丢弃沿用既有口径计入入口端口和 VLAN 计数，入口
+    镜像仍复制原始帧，出口镜像不交付。
+  * `mac_bindings` 非空时，每条 results 记录在现有可选字段之后追加
+    `binding_violation` 布尔值，仅冒用为 `true`；省略或为空数组时不增加
+    该键，现有校验、输出键序及逐字节结果保持不变。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -250,9 +273,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror`、`ingress_acl` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`mac_bindings` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port，或镜像源/目的端口) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项 port、镜像源/目的端口，或 MAC 绑定 port) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
@@ -260,7 +283,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 ## 上限
 
 * 端口数量：4096；单个端口 name 长度：64 个字符。
-* `forward` 场景事件数量：10000；静态表项数量：10000；入口 ACL 规则数量：4096。
+* `forward` 场景事件数量：10000；静态表项数量：10000；入口 ACL 规则数量：4096；MAC 绑定数量：10000。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 
 ## 状态
