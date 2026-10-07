@@ -904,6 +904,13 @@ def _check_include_fdb_events(value, path):
     return value
 
 
+def _check_include_qos_counters(value, path):
+    # include_qos_counters 是场景级开关，类型错误归 ConfigError。
+    if not isinstance(value, bool):
+        raise ConfigError("'include_qos_counters' must be a boolean", path)
+    return value
+
+
 def _check_aging_time_ms(value, path):
     # aging_time_ms 是场景级配置字段，类型/范围错误归 ConfigError。
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1537,7 +1544,7 @@ def validate_scenario(scenario):
     static_map, include_fdb_events, mirror_sources, mirror_destination,
     egress_mirror_sources, egress_mirror_destination, acl_rules, binding_map,
     storm_control, multicast_storm_control, unknown_unicast_storm_control,
-    qos_queues)：
+    qos_queues, include_qos_counters)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
     "trunk_pvid", "hybrid_vids", "hybrid_pvid", "hybrid_untagged_vids",
@@ -1566,6 +1573,9 @@ def validate_scenario(scenario):
     抑制或老化时每个事件都必须携带 time_ms，都未启用时不得出现 time_ms。
     qos_queues 为 (queue_count, pcp_to_queue, untagged_queue)，
     未提供 qos_queues 时为 None。
+    include_qos_counters 缺省或为 false 时为 False，输出不含 qos_counters；
+    为 true 时必须同时提供 qos_queues，否则在处理任何事件前以
+    ConfigError (路径 $.include_qos_counters) 失败。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -1575,6 +1585,7 @@ def validate_scenario(scenario):
     aging_time_ms = None
     include_counters = False
     include_fdb_events = False
+    include_qos_counters = False
     for field, value in scenario.items():
         path = "$." + field
         if field == "ports":
@@ -1590,6 +1601,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "include_fdb_events":
             include_fdb_events = _check_include_fdb_events(value, path)
+            seen_fields.add(field)
+        elif field == "include_qos_counters":
+            include_qos_counters = _check_include_qos_counters(value, path)
             seen_fields.add(field)
         elif field == "static_table":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
@@ -1625,6 +1639,13 @@ def validate_scenario(scenario):
         raise ConfigError("missing field 'ports'", "$.ports")
     if "events" not in seen_fields:
         raise FrameError("missing field 'events'", "$.events")
+    if include_qos_counters and "qos_queues" not in seen_fields:
+        # 队列计数依赖 qos_queues 的分类配置；为 true 而缺失时在处理任何
+        # 事件前失败，路径指向开关本身。
+        raise ConfigError(
+            "'include_qos_counters' requires 'qos_queues'",
+            "$.include_qos_counters",
+        )
 
     ports = scenario["ports"]
     if not isinstance(ports, list):
@@ -1806,6 +1827,7 @@ def validate_scenario(scenario):
         multicast_storm_control,
         unknown_unicast_storm_control,
         qos_queues,
+        include_qos_counters,
     )
 
 
@@ -1828,6 +1850,7 @@ def run_scenario(scenario):
         multicast_storm_control,
         unknown_unicast_storm_control,
         qos_queues,
+        include_qos_counters,
     ) = validate_scenario(scenario)
     mirror_enabled = mirror_sources is not None
     egress_mirror_enabled = egress_mirror_sources is not None
@@ -1879,7 +1902,17 @@ def run_scenario(scenario):
     # 除结果数组外不保留跨事件队列状态。
     qos_enabled = qos_queues is not None
     if qos_enabled:
-        _, qos_pcp_to_queue, qos_untagged_queue = qos_queues
+        qos_queue_count, qos_pcp_to_queue, qos_untagged_queue = qos_queues
+
+    # 队列计数状态仅在 include_qos_counters 为真时维护 (此时 qos_queues
+    # 必然存在)；只读取每事件已确定的 egress_ports 与队列分类，不参与
+    # 学习、查表或转发决定。状态上界为端口数乘队列数。
+    if include_qos_counters:
+        qos_port_stats = {
+            name: [0] * qos_queue_count for name in sorted(port_by_name)
+        }
+    else:
+        qos_port_stats = None
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -2404,6 +2437,15 @@ def run_scenario(scenario):
             # VLAN 出口计数为该 VLAN 实际出口交付的总数。
             vlan_entry[1] += len(egress)
 
+        if include_qos_counters:
+            # 队列计数只统计普通出口交付 (egress_ports)：泛洪的每个实际出口
+            # 分别计数，单播只计命中的实际出口；dropped、filtered、无出口
+            # 事件与入口/出口镜像副本都不计入。队列归属沿用本事件
+            # egress_queues 的分类 (同一事件全部出口同属一个队列)，混合端口
+            # 出站剥除或携带标签不改变该归属。
+            for name in egress:
+                qos_port_stats[name][qos_queue] += 1
+
     # 表项按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序排列。
     # 最后事件时刻仍有效的表项才会出现在快照中，字段与键序保持不变。
     entries = [
@@ -2454,6 +2496,24 @@ def run_scenario(scenario):
         # fdb_events 位于所有既有区段 (含 counters) 之后，按输入事件顺序记录
         # 实际提交的动态表变化；缺省或为 false 时输出不含该键。
         output["fdb_events"] = fdb_events
+
+    if include_qos_counters:
+        # qos_counters 位于所有既有区段 (含 fdb_events) 之后：ports 按端口
+        # name 的 Unicode 码点升序包含全部已配置物理端口 (qos_port_stats
+        # 已按此序构建)，queues 按队列号升序包含 0..queue_count-1 的全部
+        # 队列，计数为零也保留；缺省或为 false 时输出不含该键。
+        output["qos_counters"] = {
+            "ports": [
+                {
+                    "name": name,
+                    "queues": [
+                        {"queue": queue, "egress_frames": counts[queue]}
+                        for queue in range(qos_queue_count)
+                    ],
+                }
+                for name, counts in qos_port_stats.items()
+            ]
+        }
 
     return output
 
@@ -2681,6 +2741,14 @@ def build_parser():
             "后追加 egress_queues (每项含 port、queue，与 egress_ports 同序"
             "且一一对应，无出口时为空数组)；只做分类与审计，不改变转发决定，"
             "省略时行为与输出逐字节不变；"
+            "可选 include_qos_counters 为 true 时 (必须同时提供合法的 "
+            "qos_queues，否则在处理任何事件前以 ConfigError 失败，路径 "
+            "$.include_qos_counters) 在所有既有区段之后追加 qos_counters："
+            "ports 按端口 name 的 Unicode 码点升序包含全部已配置物理端口，"
+            "每项的 queues 按队列号升序包含 0..queue_count-1 的全部队列 "
+            "(每项含 queue 与 egress_frames，计数为零也保留)，按事件的实际"
+            "普通出口逐端口逐队列累计 (泛洪分别计数，镜像副本不计入)；"
+            "缺省或为 false 时行为与输出逐字节不变；"
             "无端口模式或跨进程持久化。"
             % (
                 MAX_ACL_RULES,
@@ -2719,7 +2787,8 @@ def build_parser():
         help=(
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
             "可选 aging_time_ms、static_table、mac_bindings、include_counters、"
-            "include_fdb_events、ingress_mirror、egress_mirror、"
+            "include_fdb_events、include_qos_counters、ingress_mirror、"
+            "egress_mirror、"
             "ingress_acl、broadcast_storm_control、multicast_storm_control、"
             "unknown_unicast_storm_control 与 qos_queues；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化或风暴抑制时每个事件"

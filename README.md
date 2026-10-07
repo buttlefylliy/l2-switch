@@ -466,6 +466,24 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     键序、退出码及逐字节输出保持不变；启用后不改变转发决定、
     `egress_ports`、镜像、计数、FDB 状态及审计记录。每个事件的新增时间
     与实际出口数线性相关，除结果数组外不保留跨事件队列状态。
+* 场景可选顶层 `include_qos_counters`（布尔）：为 true 时必须同时提供
+  合法的 `qos_queues`；完整场景校验成功后，程序沿用现有流程确定每个事件
+  的 `egress_ports` 与 `egress_queues`，并为每一组对应的普通出口端口与
+  队列累计一次 `egress_frames`，在现有全部顶层区段之后追加
+  `qos_counters`。缺省或为 false 时输出与此前逐字节一致。
+  `include_qos_counters` 不是布尔值，或为 true 但缺少 `qos_queues` 时，
+  都在处理任何事件前以 ConfigError（退出码 3，路径
+  `$.include_qos_counters`）失败，标准输出不写入部分结果。
+  * `qos_counters.ports` 按端口 name 的 Unicode 码点升序包含全部已配置
+    物理端口，每项固定包含 `name` 与 `queues`；`queues` 按队列号升序包含
+    `qos_queues` 声明范围内（0 到 `queue_count`-1）的全部队列，每项固定
+    包含 `queue` 与 `egress_frames`，即使计数为零也不省略。
+  * 泛洪产生的每个实际出口分别计数，单播只计命中的实际出口；
+    `dropped`、`filtered`、无出口事件以及入口或出口镜像副本都不计入；
+    混合端口出站剥除或携带 VLAN 标签不改变已经确定的队列归属。
+  * 该开关不改变转发决定、`egress_ports`、`egress_queues`、FDB、镜像、
+    风暴抑制及既有 `counters`；新增处理时间以实际普通出口副本数为上界，
+    附加计数状态以端口数乘队列数为上界。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -474,7 +492,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
 
