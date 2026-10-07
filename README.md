@@ -65,6 +65,37 @@ VLAN；`hybrid_untagged_vids` 为 `hybrid_vids` 的不重复子集（可为空
 类型或范围错误以 ConfigError（退出码 3，路径
 `$.ports[i].dynamic_mac_limit`）失败。
 
+### `config-diff`
+
+按命令行参数顺序读取 before 与 after 两个 UTF-8 JSON 端口配置文件
+（`config-diff BEFORE AFTER`），两侧沿用 `ports` 的全部字段、校验规则、
+数量上限（每侧最多 4096 个端口）、排序与派生状态语义。程序先完整读取并
+校验两份配置，全部成功后才比较校验后的规范化快照，因此结果不受原始 JSON
+字段顺序影响：VLAN 数组仅输入顺序不同、或可选字段在两侧都省略时不产生
+差异。
+
+成功时向标准输出写入一行固定键序 JSON，顶层依次为 `schema`、
+`added_ports`、`removed_ports`、`changed_ports`、`unchanged_count`：
+
+* `added_ports` 保存 after 独有端口的完整规范化快照，`removed_ports`
+  保存 before 独有端口的完整快照。端口改名视为删除加新增，不推断重命名。
+* 同名端口只要任一公开快照字段（含派生字段）不同就进入 `changed_ports`，
+  每项依次含 `name`、`before`、`after`、`changed_fields`；`before` 与
+  `after` 保存该端口的完整快照，`changed_fields` 先按 `ports` 的规范
+  字段顺序（跳过两侧相同的 `name`）列出实际变化的字段，再列出发生变化的
+  `can_forward`、`can_learn` 派生字段。
+* 三个数组都按 name 的 Unicode 码点升序排列；`unchanged_count` 只统计
+  同名且完整快照完全相同的端口。两侧语义相同时三个数组为空。相同输入
+  重复执行逐字节一致。
+
+任一侧文件读取、UTF-8 解码或 JSON 解析失败时以 InputError（退出码 2）
+失败；端口结构、字段、类型、范围或互斥关系非法时以 ConfigError（退出码
+3）失败。错误 JSON 的 `path` 分别置于 `$.before` 或 `$.after` 下以标明
+失败侧（如 `$.before.ports[0].kind`、`$.after.ports`）；顶层非对象时
+路径为 `$.before` 或 `$.after`。任一侧失败时标准输出不写入部分结果，
+标准错误继续写入固定键序 `(type, message, path)` 的单行 JSON。两侧均
+合法时时间上界为 O(n log n)，附加内存为 O(n)。
+
 ### `frame`
 
 读取 UTF-8 JSON 单帧描述，做离线合法性判定 (runt/oversize/bad_fcs 等)，
@@ -434,4 +465,4 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 
 ## 状态
 
-功能按增量需求持续构建；当前包含 ports、frame、forward 三个子命令。
+功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward 四个子命令。

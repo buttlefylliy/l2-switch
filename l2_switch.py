@@ -25,6 +25,7 @@ MAX_ACL_RULES = 4096
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
 FORWARD_SCHEMA = "l2-switch/forward-v1"
+CONFIG_DIFF_SCHEMA = "l2-switch/config-diff-v1"
 # 未标记帧归入 VLAN 1；带标签帧按 vid 隔离，vid 0 也是独立域。
 UNTAGGED_VID = 1
 
@@ -540,6 +541,123 @@ def cmd_ports(args):
         emit_error("ConfigError", exc.message, exc.path)
         return 3
 
+    sys.stdout.buffer.write(
+        (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    return 0
+
+
+# 公开快照字段的比较顺序：先 ports 规范字段顺序 (FIELD_ORDER)，
+# 再追加 can_forward、can_learn 两个派生字段。
+DIFF_DERIVED_FIELDS = ("can_forward", "can_learn")
+
+
+def with_side_prefix(path, side):
+    """把 ports 校验错误路径加上 $.before 或 $.after 侧前缀。"""
+    root = "$." + side
+    if path == "$":
+        return root
+    return root + path[1:]
+
+
+def diff_configs(before_snapshot, after_snapshot):
+    """比较两份 validate() 产出的规范化快照，返回固定键序的比较结果。
+
+    比较对象为规范化后的快照，与原始 JSON 字段顺序无关：VLAN 数组已按
+    数值升序规范化，两侧都省略的可选字段不产生差异。按 name 匹配端口
+    (不推断改名)：after 独有为 added、before 独有为 removed；同名端口
+    任一公开快照字段 (含派生字段) 不同即进入 changed，changed_fields
+    先按 FIELD_ORDER 再按 can_forward、can_learn 列实际变化字段。
+    """
+    before_by_name = {
+        entry["name"]: entry for entry in before_snapshot["ports"]
+    }
+    after_by_name = {
+        entry["name"]: entry for entry in after_snapshot["ports"]
+    }
+    before_names = set(before_by_name)
+    after_names = set(after_by_name)
+
+    # 集合差/交的迭代顺序不确定，统一按 name 的 Unicode 码点升序排序。
+    added_names = sorted(after_names - before_names)
+    removed_names = sorted(before_names - after_names)
+    common_names = sorted(before_names & after_names)
+
+    changed_ports = []
+    unchanged_count = 0
+    for name in common_names:
+        before_entry = before_by_name[name]
+        after_entry = after_by_name[name]
+        if before_entry == after_entry:
+            # 同名且完整快照逐字段相同才计入 unchanged。
+            unchanged_count += 1
+            continue
+
+        changed_fields = []
+        for field in FIELD_ORDER:
+            # name 由匹配方式保证相同；只比较其余公开规范字段。
+            if field == "name":
+                continue
+            in_before = field in before_entry
+            in_after = field in after_entry
+            if not in_before and not in_after:
+                # 可选字段在两侧都省略时不产生差异。
+                continue
+            if in_before != in_after or before_entry[field] != after_entry[field]:
+                # 仅一侧出现 (新增/移除可选字段) 或两侧规范化值不同。
+                changed_fields.append(field)
+        for field in DIFF_DERIVED_FIELDS:
+            if before_entry[field] != after_entry[field]:
+                changed_fields.append(field)
+
+        changed_ports.append(
+            {
+                "name": name,
+                "before": before_entry,
+                "after": after_entry,
+                "changed_fields": changed_fields,
+            }
+        )
+
+    return {
+        "schema": CONFIG_DIFF_SCHEMA,
+        "added_ports": [after_by_name[name] for name in added_names],
+        "removed_ports": [before_by_name[name] for name in removed_names],
+        "changed_ports": changed_ports,
+        "unchanged_count": unchanged_count,
+    }
+
+
+def cmd_config_diff(args):
+    # 先完整读取两份文件，再分别校验，全部成功后才比较；
+    # 任一侧失败时标准输出不写入任何内容。
+    try:
+        before_config = read_config(args.before)
+    except ValueError as exc:
+        emit_error("InputError", str(exc), "$.before")
+        return 2
+    try:
+        after_config = read_config(args.after)
+    except ValueError as exc:
+        emit_error("InputError", str(exc), "$.after")
+        return 2
+
+    try:
+        before_snapshot = validate(before_config)
+    except ConfigError as exc:
+        emit_error(
+            "ConfigError", exc.message, with_side_prefix(exc.path, "before")
+        )
+        return 3
+    try:
+        after_snapshot = validate(after_config)
+    except ConfigError as exc:
+        emit_error(
+            "ConfigError", exc.message, with_side_prefix(exc.path, "after")
+        )
+        return 3
+
+    result = diff_configs(before_snapshot, after_snapshot)
     sys.stdout.buffer.write(
         (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
     )
@@ -2274,6 +2392,36 @@ def build_parser():
         help="UTF-8 JSON 配置文件路径，顶层包含 ports 数组",
     )
     ports_parser.set_defaults(func=cmd_ports)
+
+    config_diff_parser = subparsers.add_parser(
+        "config-diff",
+        help="按 before/after 顺序比较两份物理端口配置的规范化快照",
+        description=(
+            "按命令行参数顺序读取 before 与 after 两个 UTF-8 JSON 端口配置"
+            "文件，沿用 ports 的全部字段、校验规则、数量上限、排序与派生状态"
+            "语义，比较两侧校验后的规范化快照 (不受原始 JSON 字段顺序影响)："
+            "after 独有端口为 added_ports，before 独有端口为 removed_ports，"
+            "同名端口任一公开快照字段不同则进入 changed_ports (改名视为删除加"
+            "新增，不推断重命名)。"
+        ),
+        epilog=(
+            "限制: 每侧端口数量上限为 %d；单个端口 name 长度上限为 %d 个字符。"
+            "三个结果数组均按 name 的 Unicode 码点升序排列；"
+            "相同输入重复执行的输出逐字节一致。"
+            % (MAX_PORTS, MAX_PORT_NAME_LEN)
+        ),
+    )
+    config_diff_parser.add_argument(
+        "before",
+        metavar="BEFORE",
+        help="before 侧 UTF-8 JSON 端口配置文件路径 (错误路径置于 $.before 下)",
+    )
+    config_diff_parser.add_argument(
+        "after",
+        metavar="AFTER",
+        help="after 侧 UTF-8 JSON 端口配置文件路径 (错误路径置于 $.after 下)",
+    )
+    config_diff_parser.set_defaults(func=cmd_config_diff)
 
     frame_parser = subparsers.add_parser(
         "frame",
