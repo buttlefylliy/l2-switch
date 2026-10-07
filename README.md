@@ -317,6 +317,35 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     布尔值，仅因超额被丢弃的广播事件为 `true`，其余为 `false`；省略时
     不增加该键，既有输出逐字节兼容。每次抑制判断为常数时间，附加状态不
     超过 `port_limits` 的端口数，且不保留历史窗口。
+* 场景可选顶层 `multicast_storm_control` 对象声明组播风暴抑制，结构、
+  字段、整数类型、取值范围与空 `port_limits` 的校验规则以及窗口划分
+  规则与 `broadcast_storm_control` 完全相同（仅含 `window_ms` 与
+  `port_limits`，额外字段一律拒绝）；`port_limits` 的键未引用已配置
+  物理端口时以 StateError（退出码 5，路径
+  `$.multicast_storm_control.port_limits.<端口名>`）失败；失败时标准
+  输出不写入部分结果。与广播抑制同时启用时二者独立计数。
+  * 组播指目的 MAC 首字节最低位为 1 且不等于 `ff:ff:ff:ff:ff:ff` 的帧；
+    广播和未知单播不占用组播额度。只有这样的组播帧，且已通过帧合法性、
+    入口端口状态、VLAN 入站策略、源 MAC 绑定和入口 ACL 的事件才消耗该
+    入口端口额度；前置策略丢弃的帧不计数。限额内的候选帧沿用原有学习、
+    端口安全、查表和组播泛洪流程；超额候选帧固定返回 `dropped` 和空
+    `egress_ports`：不学习、刷新或迁移 MAC，不查询目的表，也不产生
+    `learned`、`refreshed` 或 `moved` 记录。显式事件时钟触发的老化仍先
+    执行并可产生 `aged` 记录；入口镜像仍交付原始帧，出口镜像不交付被抑制
+    帧。被抑制事件按 `include_counters` 的现有语义增加入口端口和 VLAN 的
+    `ingress_frames` 与 `dropped_frames`，不增加 `egress_frames`。
+  * 启用后每个事件必须包含 `time_ms`（与 `aging_time_ms` 及
+    `broadcast_storm_control` 共用显式事件时钟，按事件顺序单调不减）；
+    省略本功能时 `time_ms` 的既有约束不变。窗口从时刻 0 开始，以
+    `time_ms` 整除 `window_ms` 的商区分，边界事件进入新窗口，只保留
+    当窗状态。
+  * 提供 `multicast_storm_control` 时，每条 results 记录在既有可选字段
+    （`mirror_ports`、`egress_mirror_ports`、`matched_acl_rule`、
+    `effective_pcp`、`binding_violation`、`storm_controlled`）之后追加
+    `multicast_storm_controlled` 布尔值，仅因本功能超额被丢弃的组播事件
+    为 `true`，其余为 `false`；省略时不增加该键，既有输出逐字节兼容。
+    每次抑制判断为常数时间，附加状态不超过 `port_limits` 的端口数，且
+    不保留历史窗口。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -325,7 +354,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
 
