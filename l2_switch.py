@@ -4,7 +4,8 @@
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
 场景内的动态 MAC 学习、静态表项、查表与转发 (forward 子命令)，
-以及单个出口端口队列快照的严格优先级或加权轮询出队调度 (qos-schedule 子命令)。
+以及单个出口端口队列快照的严格优先级或加权轮询出队调度 (qos-schedule 子命令)，
+以及离线生成树根桥与根端口选举 (stp-root 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -31,11 +32,25 @@ MAX_SCHEDULE_TOTAL_FRAMES = 10000
 MIN_SCHEDULE_WEIGHT = 1
 MAX_SCHEDULE_WEIGHT = 100
 
+# stp-root 输入的有限上限 (在 --help 中公开)。
+MAX_STP_PORTS = 4096
+MAX_STP_BPDUS = 10000
+# 桥优先级为 0..61440 且必须为 4096 的倍数 (802.1t 桥标识)。
+MIN_STP_BRIDGE_PRIORITY = 0
+MAX_STP_BRIDGE_PRIORITY = 61440
+STP_PRIORITY_STEP = 4096
+# 本地端口 path_cost 为 1..2147483647 的整数；BPDU 宣告的 root_path_cost
+# 与累计根路径代价均为 0..4294967295 的 32 位无符号整数。
+MIN_STP_PATH_COST = 1
+MAX_STP_PATH_COST = 2147483647
+MAX_STP_ROOT_PATH_COST = 4294967295
+
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
 FORWARD_SCHEMA = "l2-switch/forward-v1"
 CONFIG_DIFF_SCHEMA = "l2-switch/config-diff-v1"
 QOS_SCHEDULE_SCHEMA = "l2-switch/qos-schedule-v1"
+STP_ROOT_SCHEMA = "l2-switch/stp-root-v1"
 # 未标记帧归入 VLAN 1；带标签帧按 vid 隔离，vid 0 也是独立域。
 UNTAGGED_VID = 1
 
@@ -2886,6 +2901,381 @@ def cmd_qos_schedule(args):
     return 0
 
 
+# stp-root 快照的字段及其规范顺序；额外字段一律拒绝。
+# bridge 声明本桥标识 (priority 加六字节单播 MAC)，ports 声明参与选举的
+# 本地物理端口 (唯一 name 与 path_cost)，received_bpdus 为各端口收到的
+# BPDU 快照 (引用一个本地端口并宣告根桥/发送桥标识)。
+STP_ROOT_FIELD_ORDER = ("bridge", "ports", "received_bpdus")
+STP_ROOT_FIELD_SET = frozenset(STP_ROOT_FIELD_ORDER)
+
+STP_BRIDGE_FIELD_ORDER = ("priority", "mac")
+STP_BRIDGE_FIELD_SET = frozenset(STP_BRIDGE_FIELD_ORDER)
+
+STP_PORT_FIELD_ORDER = ("name", "path_cost")
+STP_PORT_FIELD_SET = frozenset(STP_PORT_FIELD_ORDER)
+
+STP_BPDU_FIELD_ORDER = (
+    "port",
+    "root_priority",
+    "root_mac",
+    "root_path_cost",
+    "sender_priority",
+    "sender_mac",
+    "sender_port_id",
+)
+STP_BPDU_FIELD_SET = frozenset(STP_BPDU_FIELD_ORDER)
+
+# sender_port_id 为 16 位桥端口标识，取值 0..65535。
+MIN_STP_PORT_ID = 0
+MAX_STP_PORT_ID = 65535
+
+
+def read_stp_input(path):
+    """读取并解析 UTF-8 JSON STP 快照；读取/解码/解析失败抛 ValueError。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        # 使用固定消息，避免平台/locale 文本差异影响确定性。
+        raise ValueError("cannot read input file")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("input file is not valid UTF-8")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        # JSONDecodeError 是 ValueError 的子类；超长整数等解析限制同样归为输入错误。
+        raise ValueError("input file is not valid JSON")
+
+
+def _check_stp_priority(value, path, field):
+    """桥优先级：0..61440 的整数且为 4096 的倍数 (布尔值不算整数)。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'%s' must be an integer" % field, path)
+    if value < MIN_STP_BRIDGE_PRIORITY or value > MAX_STP_BRIDGE_PRIORITY:
+        raise ConfigError(
+            "'%s' must be between %d and %d"
+            % (field, MIN_STP_BRIDGE_PRIORITY, MAX_STP_BRIDGE_PRIORITY),
+            path,
+        )
+    if value % STP_PRIORITY_STEP != 0:
+        raise ConfigError(
+            "'%s' must be a multiple of %d" % (field, STP_PRIORITY_STEP),
+            path,
+        )
+    return value
+
+
+def _check_stp_mac(value, path, field):
+    """六字节单播 MAC 地址：六个冒号分隔的两位十六进制字节，首字节最低位为 0。"""
+    if not isinstance(value, str):
+        raise ConfigError("'%s' must be a string" % field, path)
+    if not MAC_PATTERN.fullmatch(value):
+        raise ConfigError(
+            "'%s' must be six colon-separated two-digit hex octets" % field,
+            path,
+        )
+    mac = value.lower()
+    if int(mac.split(":")[0], 16) & 1:
+        raise ConfigError("'%s' must be a unicast address" % field, path)
+    return mac
+
+
+def _check_stp_path_cost(value, path):
+    """本地端口 path_cost：1..2147483647 的整数 (布尔值不算整数)。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'path_cost' must be an integer", path)
+    if value < MIN_STP_PATH_COST or value > MAX_STP_PATH_COST:
+        raise ConfigError(
+            "'path_cost' must be between %d and %d"
+            % (MIN_STP_PATH_COST, MAX_STP_PATH_COST),
+            path,
+        )
+    return value
+
+
+def _check_stp_root_path_cost(value, path):
+    """BPDU 宣告的 root_path_cost：0..4294967295 的整数 (布尔值不算整数)。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'root_path_cost' must be an integer", path)
+    if value < 0 or value > MAX_STP_ROOT_PATH_COST:
+        raise ConfigError(
+            "'root_path_cost' must be between 0 and %d"
+            % MAX_STP_ROOT_PATH_COST,
+            path,
+        )
+    return value
+
+
+def _check_stp_port_id(value, path):
+    """sender_port_id：0..65535 的整数 (布尔值不算整数)。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'sender_port_id' must be an integer", path)
+    if value < MIN_STP_PORT_ID or value > MAX_STP_PORT_ID:
+        raise ConfigError(
+            "'sender_port_id' must be between %d and %d"
+            % (MIN_STP_PORT_ID, MAX_STP_PORT_ID),
+            path,
+        )
+    return value
+
+
+def _check_stp_bpdu_port(value, path):
+    # 引用校验在整条 BPDU 结构校验完成后进行，未知端口归 StateError。
+    if not isinstance(value, str):
+        raise ConfigError("'port' must be a string", path)
+    return value
+
+
+STP_BPDU_FIELD_CHECKS = {
+    "port": _check_stp_bpdu_port,
+    "root_priority": lambda value, path: _check_stp_priority(
+        value, path, "root_priority"
+    ),
+    "root_mac": lambda value, path: _check_stp_mac(value, path, "root_mac"),
+    "root_path_cost": _check_stp_root_path_cost,
+    "sender_priority": lambda value, path: _check_stp_priority(
+        value, path, "sender_priority"
+    ),
+    "sender_mac": lambda value, path: _check_stp_mac(value, path, "sender_mac"),
+    "sender_port_id": _check_stp_port_id,
+}
+
+
+def validate_stp_root_input(snapshot):
+    """离线校验 STP 根桥/根端口选举快照。
+
+    顶层必须且仅含 bridge、ports、received_bpdus：bridge 为仅含
+    priority (0..61440 且为 4096 倍数的整数) 与 mac (六字节单播地址)
+    的对象；ports 为最多 4096 项的数组，每项仅含唯一 name (非空字符串)
+    与 path_cost (1..2147483647 的整数，布尔值不算整数)；
+    received_bpdus 为最多 10000 项的数组，每项仅含 port、root_priority、
+    root_mac、root_path_cost、sender_priority、sender_mac、
+    sender_port_id 七个字段 (整数均拒绝布尔值，MAC 均为六字节单播地址)。
+    按字段在输入中出现的顺序报告首个错误，再按规范顺序报告缺失字段；
+    BPDU 的 port 引用未知端口为 StateError。结构、字段、类型、范围、
+    重复端口名与非法 MAC 均为 ConfigError，path 精确指向对应字段或元素。
+    选举所需的累计代价溢出检查在 elect_stp_root 中完成。
+    """
+    if not isinstance(snapshot, dict):
+        raise ConfigError("top-level input must be an object", "$")
+
+    values = {}
+    for field, value in snapshot.items():
+        path = "$." + field
+        if field not in STP_ROOT_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        values[field] = value
+
+    for field in STP_ROOT_FIELD_ORDER:
+        if field not in values:
+            raise ConfigError("missing field '%s'" % field, "$." + field)
+
+    bridge = values["bridge"]
+    bridge_path = "$.bridge"
+    if not isinstance(bridge, dict):
+        raise ConfigError("'bridge' must be an object", bridge_path)
+    bridge_values = {}
+    for field, value in bridge.items():
+        path = bridge_path + "." + field
+        if field not in STP_BRIDGE_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        if field == "priority":
+            bridge_values[field] = _check_stp_priority(value, path, "priority")
+        else:
+            bridge_values[field] = _check_stp_mac(value, path, "mac")
+    for field in STP_BRIDGE_FIELD_ORDER:
+        if field not in bridge_values:
+            raise ConfigError(
+                "missing field '%s'" % field, bridge_path + "." + field
+            )
+
+    ports = values["ports"]
+    ports_path = "$.ports"
+    if not isinstance(ports, list):
+        raise ConfigError("'ports' must be an array", ports_path)
+    if len(ports) > MAX_STP_PORTS:
+        raise ConfigError(
+            "number of ports exceeds maximum of %d" % MAX_STP_PORTS,
+            ports_path,
+        )
+
+    port_names = set()
+    for index, item in enumerate(ports):
+        base = "%s[%d]" % (ports_path, index)
+        if not isinstance(item, dict):
+            raise ConfigError("port must be an object", base)
+        port_values = {}
+        for field, value in item.items():
+            path = base + "." + field
+            if field not in STP_PORT_FIELD_SET:
+                raise ConfigError("unexpected field '%s'" % field, path)
+            if field == "name":
+                name = _check_name(value, path)
+                if name in port_names:
+                    raise ConfigError(
+                        "duplicate port name '%s'" % name, path
+                    )
+                port_names.add(name)
+                port_values[field] = name
+            else:
+                port_values[field] = _check_stp_path_cost(value, path)
+        for field in STP_PORT_FIELD_ORDER:
+            if field not in port_values:
+                raise ConfigError(
+                    "missing field '%s'" % field, base + "." + field
+                )
+
+    bpdus = values["received_bpdus"]
+    bpdus_path = "$.received_bpdus"
+    if not isinstance(bpdus, list):
+        raise ConfigError("'received_bpdus' must be an array", bpdus_path)
+    if len(bpdus) > MAX_STP_BPDUS:
+        raise ConfigError(
+            "number of received bpdus exceeds maximum of %d" % MAX_STP_BPDUS,
+            bpdus_path,
+        )
+
+    for index, item in enumerate(bpdus):
+        base = "%s[%d]" % (bpdus_path, index)
+        if not isinstance(item, dict):
+            raise ConfigError("bpdu must be an object", base)
+        bpdu_values = {}
+        for field, value in item.items():
+            path = base + "." + field
+            if field not in STP_BPDU_FIELD_SET:
+                raise ConfigError("unexpected field '%s'" % field, path)
+            bpdu_values[field] = STP_BPDU_FIELD_CHECKS[field](value, path)
+        for field in STP_BPDU_FIELD_ORDER:
+            if field not in bpdu_values:
+                raise ConfigError(
+                    "missing field '%s'" % field, base + "." + field
+                )
+        if bpdu_values["port"] not in port_names:
+            raise StateError(
+                "unknown port '%s'" % bpdu_values["port"], base + ".port"
+            )
+
+
+def _stp_mac_to_int(mac):
+    """把规范化 MAC 字符串解释为 48 位无符号整数，用于按数值比较桥标识。"""
+    return int(mac.replace(":", ""), 16)
+
+
+def elect_stp_root(snapshot):
+    """对已校验快照离线选举根桥与根端口，返回固定键序结果。
+
+    先在本桥标识与各 BPDU 宣告的根桥标识间按 (priority, MAC 数值)
+    升序确定根桥：本桥标识不大于任何宣告时本桥胜出 (is_root 为 true、
+    root_path_cost 为 0、root_port 为 null)。否则仅比较宣告胜出根桥的
+    BPDU，候选依次按 (root_path_cost 加本地端口 path_cost、发送桥
+    priority、发送桥 MAC 数值、sender_port_id、本地端口 name) 取最小；
+    同端口多条 BPDU 均参与，比较不依赖输入顺序，完全相同的候选取输入中
+    最早的一条仅用于错误路径定位。胜出候选的累计代价超过
+    4294967295 时以 ConfigError 失败。两次线性扫描完成选举，除本地
+    端口代价映射 O(p) 外不保留额外状态，总时间为 O(p+b)。
+    """
+    bridge = snapshot["bridge"]
+    local_priority = bridge["priority"]
+    local_mac = bridge["mac"].lower()
+    local_bridge_id = (local_priority, _stp_mac_to_int(local_mac))
+
+    # 仅保留本地端口 name -> path_cost 的 O(p) 附加映射。
+    port_cost = {
+        port["name"]: port["path_cost"] for port in snapshot["ports"]
+    }
+    bpdus = snapshot["received_bpdus"]
+
+    # 第一轮：在本桥与各 BPDU 宣告的根桥标识间选最小标识。
+    winning_root = local_bridge_id
+    for bpdu in bpdus:
+        announced = (
+            bpdu["root_priority"],
+            _stp_mac_to_int(bpdu["root_mac"].lower()),
+        )
+        if announced < winning_root:
+            winning_root = announced
+
+    bridge_result = {"priority": local_priority, "mac": local_mac}
+
+    if winning_root == local_bridge_id:
+        return {
+            "schema": STP_ROOT_SCHEMA,
+            "bridge": bridge_result,
+            "root": {"priority": local_priority, "mac": local_mac},
+            "is_root": True,
+            "root_path_cost": 0,
+            "root_port": None,
+        }
+
+    # 第二轮：仅比较宣告胜出根桥的 BPDU，按完整候选键取最小。
+    best_key = None
+    best_index = None
+    for index, bpdu in enumerate(bpdus):
+        announced = (
+            bpdu["root_priority"],
+            _stp_mac_to_int(bpdu["root_mac"].lower()),
+        )
+        if announced != winning_root:
+            continue
+        total_cost = bpdu["root_path_cost"] + port_cost[bpdu["port"]]
+        key = (
+            total_cost,
+            bpdu["sender_priority"],
+            _stp_mac_to_int(bpdu["sender_mac"].lower()),
+            bpdu["sender_port_id"],
+            bpdu["port"],
+        )
+        # 完全相同的候选保留最早下标，仅用于确定的错误路径定位。
+        if best_key is None or key < best_key:
+            best_key = key
+            best_index = index
+
+    if best_key[0] > MAX_STP_ROOT_PATH_COST:
+        raise ConfigError(
+            "sum of 'root_path_cost' and port 'path_cost' must not exceed %d"
+            % MAX_STP_ROOT_PATH_COST,
+            "$.received_bpdus[%d].root_path_cost" % best_index,
+        )
+
+    winning_bpdu = bpdus[best_index]
+    return {
+        "schema": STP_ROOT_SCHEMA,
+        "bridge": bridge_result,
+        "root": {
+            "priority": winning_root[0],
+            "mac": winning_bpdu["root_mac"].lower(),
+        },
+        "is_root": False,
+        "root_path_cost": best_key[0],
+        "root_port": best_key[4],
+    }
+
+
+def cmd_stp_root(args):
+    try:
+        snapshot = read_stp_input(args.input)
+    except ValueError as exc:
+        emit_error("InputError", str(exc))
+        return 2
+
+    try:
+        validate_stp_root_input(snapshot)
+        result = elect_stp_root(snapshot)
+    except ConfigError as exc:
+        emit_error("ConfigError", exc.message, exc.path)
+        return 3
+    except StateError as exc:
+        emit_error("StateError", exc.message, exc.path)
+        return 5
+
+    sys.stdout.buffer.write(
+        (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="l2_switch.py",
@@ -3186,6 +3576,52 @@ def build_parser():
         ),
     )
     qos_schedule_parser.set_defaults(func=cmd_qos_schedule)
+
+    stp_root_parser = subparsers.add_parser(
+        "stp-root",
+        help="离线选举生成树根桥与根端口",
+        description=(
+            "通过 --input 读取 UTF-8 JSON 快照 (顶层包含 bridge、ports 与 "
+            "received_bpdus)，离线选举根桥和根端口，并向标准输出写入单行"
+            "固定键序 JSON。先在本桥与各 BPDU 宣告的根桥标识间按 "
+            "priority、MAC 数值升序确定根桥：本桥胜出时 is_root 为 true、"
+            "root_path_cost 为 0、root_port 为 null；否则仅比较宣告胜出"
+            "根桥的 BPDU，依次按 root_path_cost 加本地 path_cost、发送桥 "
+            "priority、发送桥 MAC、sender_port_id、本地端口 name 取最小"
+            "候选，代价之和不得超过 4294967295。同端口多条 BPDU 均参与，"
+            "结果不依赖输入顺序。"
+        ),
+        epilog=(
+            "限制: 端口数量上限为 %d；BPDU 数量上限为 %d；"
+            "bridge priority 为 %d..%d 且为 %d 的倍数；"
+            "端口 path_cost 为 1..%d；root_path_cost 为 0..%d；"
+            "sender_port_id 为 0..65535。"
+            "相同输入的输出逐字节一致，单次时间为 O(p+b)，不读墙上时钟。"
+            % (
+                MAX_STP_PORTS,
+                MAX_STP_BPDUS,
+                MIN_STP_BRIDGE_PRIORITY,
+                MAX_STP_BRIDGE_PRIORITY,
+                STP_PRIORITY_STEP,
+                MAX_STP_PATH_COST,
+                MAX_STP_ROOT_PATH_COST,
+            )
+        ),
+    )
+    stp_root_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="FILE",
+        help=(
+            "UTF-8 JSON STP 快照文件路径，顶层包含 bridge (priority 为 "
+            "0..61440 且为 4096 倍数的整数，mac 为六字节单播地址)、ports "
+            "(每项含唯一 name 与 1..2147483647 的 path_cost，最多 4096 项) "
+            "与 received_bpdus (每项引用一个端口并含 root_priority、"
+            "root_mac、root_path_cost、sender_priority、sender_mac、"
+            "sender_port_id，最多 10000 条)；布尔值不算整数"
+        ),
+    )
+    stp_root_parser.set_defaults(func=cmd_stp_root)
 
     return parser
 

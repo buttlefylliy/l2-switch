@@ -539,15 +539,68 @@ ConfigError（退出码 3）失败，路径精确指向 `$.discipline`、`$.weig
 结果，单次时间为 O(n+queue_count)，附加内存为 O(n)；不读墙上时钟，不保留
 跨进程状态。
 
+### `stp-root`
+
+通过 `--input` 读取一个 UTF-8 JSON 生成树快照，离线选举根桥与根端口，向标准
+输出写入单行固定键序 JSON。顶层必须且仅含 `bridge`、`ports`、
+`received_bpdus` 三个字段：
+
+* `bridge` 为仅含 `priority` 与 `mac` 的对象：`priority` 为 0 到 61440 的
+  整数且必须为 4096 的倍数（布尔值不算整数），`mac` 为六字节单播 MAC
+  地址（六个冒号分隔的两位十六进制字节，首字节最低位为 0，输出规范化为小写）。
+* `ports` 为最多 4096 项的数组；每项仅含唯一 `name`（非空字符串，最长
+  64 个字符，不得重复）与 `path_cost`（1 到 2147483647 的整数，布尔值
+  不算整数）。
+* `received_bpdus` 为最多 10000 项的数组；每条 BPDU 仅含 `port`、
+  `root_priority`、`root_mac`、`root_path_cost`、`sender_priority`、
+  `sender_mac`、`sender_port_id`：`port` 引用 `ports` 中一个端口名；
+  `root_priority` 与 `sender_priority` 的取值规则同 `bridge.priority`；
+  `root_mac` 与 `sender_mac` 的取值规则同 `bridge.mac`；
+  `root_path_cost` 为 0 到 4294967295 的整数（布尔值不算整数）；
+  `sender_port_id` 为 0 到 65535 的整数（布尔值不算整数）。同一端口可
+  收到多条 BPDU，全部参与选举。
+
+选举规则：
+
+* 先在本桥标识与各 BPDU 宣告的根桥标识之间，按 `(priority, MAC 数值)`
+  升序确定根桥（MAC 按 48 位无符号整数比较，而非字符串）。本桥标识为
+  最小（含与某宣告完全相同）时本桥胜出：`is_root` 为 true、
+  `root_path_cost` 为 0、`root_port` 为 null。
+* 本桥未胜出时，仅比较宣告了胜出根桥标识的 BPDU；候选依次按
+  `(root_path_cost 加接收端口的本地 path_cost、发送桥 priority、发送桥
+  MAC 数值、sender_port_id、本地端口 name)` 取最小候选。
+  `root_path_cost` 与本地 `path_cost` 之和不得超过 4294967295，溢出时
+  以 ConfigError（退出码 3，路径指向该 BPDU 的 `root_path_cost`）失败；
+  只有胜出候选的代价参与溢出判定，宣告其他根桥或未胜出的候选不报错。
+* 选举结果不依赖 BPDU 与端口的输入顺序；完全相同的候选不影响结果。
+
+成功时输出单行固定键序 JSON，顶层依次为 `schema`、`bridge`、`root`、
+`is_root`、`root_path_cost`、`root_port`：`schema` 为
+`l2-switch/stp-root-v1`；`bridge` 与 `root` 均含 `priority` 和规范化
+小写 `mac`；非根桥时 `root_path_cost` 为胜出候选的累计代价，
+`root_port` 为其本地端口名。
+
+文件读取、UTF-8 解码或 JSON 解析失败时以 InputError（退出码 2，错误
+`path` 为 null）失败；顶层或嵌套对象不是对象/数组、字段缺失或多余、
+整数类型或范围非法（含布尔值冒充整数）、priority 不是 4096 的倍数、
+重复端口名、非法或非单播 MAC、端口或 BPDU 数量超限，以及胜出候选代价
+溢出时，都以 ConfigError（退出码 3）失败，路径精确指向首个错误的字段或
+数组元素（如 `$.ports[2].path_cost`、
+`$.received_bpdus[0].sender_port_id`）；BPDU 的 `port` 引用未知端口时
+以 StateError（退出码 5，路径 `$.received_bpdus[i].port`）失败。失败时
+标准输出不写入部分结果，标准错误写入固定键序 `(type, message, path)` 的
+单行 JSON。程序在写出标准输出前完成整个快照校验；相同输入逐字节一致，
+不读墙上时钟，单次处理时间为 O(p+b)，附加内存为 O(p)。
+
 ## 退出码与错误
 
 | 退出码 | 类型 | 含义 |
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、`discipline`/`weights` 搭配、帧标识或重复标识错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、`discipline`/`weights` 搭配、帧标识或重复标识错误；`stp-root` 输入的结构、字段、类型、范围、数量上限、重复端口名、非法 MAC、priority 倍数或胜出候选代价溢出错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口，或 `stp-root` BPDU 的 port) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
@@ -558,7 +611,8 @@ ConfigError（退出码 3）失败，路径精确指向 `$.discipline`、`$.weig
 * `forward` 场景事件数量：10000；静态表项数量：10000；源 MAC 绑定数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 * `qos-schedule`：`queue_count` 为 1 到 8；`transmit_count` 为 0 到 10000；全部队列帧合计最多 10000 项；`wrr` 的 `weights` 每项为 1 到 100。
+* `stp-root`：端口数量 4096；BPDU 数量 10000；桥 `priority` 为 0 到 61440 且为 4096 的倍数；端口 `path_cost` 为 1 到 2147483647；`root_path_cost` 为 0 到 4294967295（与本地 `path_cost` 之和亦然）；`sender_port_id` 为 0 到 65535。
 
 ## 状态
 
-功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward、qos-schedule 五个子命令。
+功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward、qos-schedule、stp-root 六个子命令。
