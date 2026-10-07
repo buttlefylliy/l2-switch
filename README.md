@@ -33,6 +33,14 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 超出范围、重复，或与 `access_vid` 同时出现时，以 ConfigError（退出码 3，
 路径 `$.ports[i].trunk_vids` 或对应元素路径）失败。
 
+每个端口可选 `trunk_pvid` 字段（1 到 4094 的整数，布尔值不算整数）声明
+中继端口的本征 VLAN，只为未标记入站流量指定内部 VLAN 归属；它只能与
+`trunk_vids` 同时出现且必须属于该允许数组（因此仍不能与 `access_vid`
+共存）。提供时快照中原样保留该数值，字段稳定位于 `trunk_vids` 之后、
+`dynamic_mac_limit` 之前；省略时不补默认键，既有快照的键序与逐字节内容
+不变。类型或范围非法、未同时配置 `trunk_vids`，或取值不在允许数组中时，
+以 ConfigError（退出码 3，路径 `$.ports[i].trunk_pvid`）失败。
+
 每个端口可选 `dynamic_mac_limit` 字段（1 到 10000 的整数，布尔值不算
 整数）声明该端口动态 MAC 学习数量上限，模拟最基本的端口安全；省略时
 不补默认键并保持无限制语义，不改变 `can_forward`/`can_learn` 的推导。
@@ -76,6 +84,14 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   才能成为泛洪或单播出口；动态或静态单播命中一个不允许该 VLAN 的中继
   端口时结果为 `dropped`，不退回泛洪。`trunk_vids` 与 `access_vid`
   互斥；未声明两种 VLAN 模式的端口行为不变。
+* 配置了 `trunk_pvid` 的中继端口为未标记入站帧（含坏帧的结果 vid 与 VLAN
+  入站计数）指定本征 VLAN：未标记帧的内部 VLAN 归为该 PVID，合法帧继续
+  既有的学习、查表、泛洪、ACL、源 MAC 绑定、端口学习上限、审计与计数
+  流程，结果中的 vid、VLAN 计数与 FDB 键都使用这个内部 VLAN。带标签帧仍
+  使用标签 VID 并受 `trunk_vids` 限制，VID 0 仍按既有策略丢弃；未配置
+  `trunk_pvid` 的中继端口仍拒绝未标记帧。出口选择仍按 `trunk_vids`
+  成员关系执行，不新增出口标签明细；省略 `trunk_pvid` 时行为与输出
+  逐字节不变。
 * 仅合法、未被丢弃且入端口 `can_learn` 为真的帧，按 (VLAN, 规范化小写单播源 MAC)
   学习；同一键从另一端口出现时迁移到新端口。
 * 端口配置了 `dynamic_mac_limit` 时启用最基本的端口安全：上限按当前绑定到

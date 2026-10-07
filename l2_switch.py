@@ -31,6 +31,8 @@ UNTAGGED_VID = 1
 # 每个端口允许的字段及其规范顺序；额外字段一律拒绝。
 # access_vid 为可选的接入 VLAN 归属，trunk_vids 为可选的中继 VLAN 允许数组，
 # 二者互斥，缺省时都不出现在快照中。
+# trunk_pvid 为可选的中继本征 VLAN，只能与 trunk_vids 同时出现且必须属于
+# 该允许数组，缺省时不出现在快照中。
 # dynamic_mac_limit 为可选的端口动态 MAC 学习数量上限 (端口安全)，
 # 缺省时不出现在快照中且保持无限制语义。
 FIELD_ORDER = (
@@ -43,16 +45,22 @@ FIELD_ORDER = (
     "duplex",
     "access_vid",
     "trunk_vids",
+    "trunk_pvid",
     "dynamic_mac_limit",
 )
 FIELD_SET = frozenset(FIELD_ORDER)
-OPTIONAL_FIELDS = frozenset(("access_vid", "trunk_vids", "dynamic_mac_limit"))
+OPTIONAL_FIELDS = frozenset(
+    ("access_vid", "trunk_vids", "trunk_pvid", "dynamic_mac_limit")
+)
 
 MIN_ACCESS_VID = 1
 MAX_ACCESS_VID = 4094
 
 MIN_TRUNK_VID = 1
 MAX_TRUNK_VID = 4094
+
+MIN_TRUNK_PVID = 1
+MAX_TRUNK_PVID = 4094
 
 MIN_DYNAMIC_MAC_LIMIT = 1
 MAX_DYNAMIC_MAC_LIMIT = 10000
@@ -235,6 +243,19 @@ def _check_trunk_vids(value, path):
     return sorted(value)
 
 
+def _check_trunk_pvid(value, path):
+    # 可选的中继本征 VLAN；bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'trunk_pvid' must be an integer", path)
+    if value < MIN_TRUNK_PVID or value > MAX_TRUNK_PVID:
+        raise ConfigError(
+            "'trunk_pvid' must be between %d and %d"
+            % (MIN_TRUNK_PVID, MAX_TRUNK_PVID),
+            path,
+        )
+    return value
+
+
 def _check_dynamic_mac_limit(value, path):
     # 可选的端口动态 MAC 学习数量上限；bool 是 int 的子类型，必须显式排除。
     if isinstance(value, bool) or not isinstance(value, int):
@@ -258,6 +279,7 @@ FIELD_CHECKS = {
     "duplex": _check_duplex,
     "access_vid": _check_access_vid,
     "trunk_vids": _check_trunk_vids,
+    "trunk_pvid": _check_trunk_pvid,
     "dynamic_mac_limit": _check_dynamic_mac_limit,
 }
 
@@ -267,6 +289,7 @@ def validate_port(item, index, seen):
 
     按字段在输入中出现的顺序报告首个错误 (未知字段、非法值或重复 name 立即
     报告)；仅当所有出现字段均合法后，才检查 access_vid 与 trunk_vids 互斥，
+    再检查 trunk_pvid 与 trunk_vids 的搭配 (必须同时出现且属于允许数组)，
     再按规范字段顺序报告首个缺失字段 (可选字段不参与缺失检查)。
     """
     base = "$.ports[%d]" % index
@@ -293,6 +316,19 @@ def validate_port(item, index, seen):
             "'trunk_vids' and 'access_vid' are mutually exclusive",
             base + ".trunk_vids",
         )
+
+    if "trunk_pvid" in values:
+        # trunk_pvid 只能与 trunk_vids 同时出现 (因此也不能与 access_vid
+        # 共存)，且必须属于该允许数组。
+        if "trunk_vids" not in values:
+            raise ConfigError(
+                "'trunk_pvid' requires 'trunk_vids'", base + ".trunk_pvid"
+            )
+        if values["trunk_pvid"] not in values["trunk_vids"]:
+            raise ConfigError(
+                "'trunk_pvid' must be a member of 'trunk_vids'",
+                base + ".trunk_pvid",
+            )
 
     for field in FIELD_ORDER:
         if field not in values and field not in OPTIONAL_FIELDS:
@@ -1156,7 +1192,8 @@ def validate_scenario(scenario):
     storm_control)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
-    "dynamic_mac_limit"} (未配置对应 VLAN 模式或学习上限时为 None)；
+    "trunk_pvid", "dynamic_mac_limit"} (未配置对应 VLAN 模式、本征 VLAN
+    或学习上限时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
     include_counters 缺省或为 false 时为 False，输出不含 counters；
@@ -1255,6 +1292,9 @@ def validate_scenario(scenario):
             # 未配置 trunk_vids 时为 None，表示不参与中继 VLAN 限制；
             # 配置时为按数值升序规范化后的允许 VID 数组。
             "trunk_vids": fields.get("trunk_vids"),
+            # 未配置 trunk_pvid 时为 None，表示中继端口不接收未标记帧；
+            # 配置时为该中继端口的本征 VLAN (保证属于 trunk_vids)。
+            "trunk_pvid": fields.get("trunk_pvid"),
             # 未配置 dynamic_mac_limit 时为 None，表示动态学习数量无限制。
             "dynamic_mac_limit": fields.get("dynamic_mac_limit"),
         }
@@ -1471,6 +1511,7 @@ def run_scenario(scenario):
         ingress_attrs = port_by_name[ingress]
         access_vid = ingress_attrs["access_vid"]
         trunk_vids = ingress_attrs["trunk_vids"]
+        trunk_pvid = ingress_attrs["trunk_pvid"]
         tagged = verdict["vlan"] is not None
         if tagged:
             # 带标签帧的内部 VLAN 取其标签 VID；在接入口上这也是违例事件的
@@ -1479,8 +1520,11 @@ def run_scenario(scenario):
         elif access_vid is not None:
             # 接入口上的未标记帧 (含坏帧) 归入其接入 VLAN。
             vid = access_vid
+        elif trunk_pvid is not None:
+            # 配置了本征 VLAN 的中继端口上的未标记帧 (含坏帧) 归入该 PVID。
+            vid = trunk_pvid
         else:
-            # 中继端口与其他端口上的未标记帧 (含坏帧) 归入缺省 VLAN 1。
+            # 其他端口上的未标记帧 (含坏帧) 归入缺省 VLAN 1。
             vid = UNTAGGED_VID
         src_mac = verdict["src_mac"]
         dst_mac = verdict["dst_mac"]
@@ -1490,8 +1534,10 @@ def run_scenario(scenario):
         # 入端口不能转发：该事件确定为 dropped。
         # 接入口收到任何带 802.1Q 标签的帧 (含 VID 0 或与 access_vid 相同)：
         # 接入策略违例，dropped，不学习、不查表、无出口。
-        # 中继端口收到未标记帧，或标签 VID 为 0 或不在 trunk_vids 允许数组中：
-        # 中继策略违例，dropped，不学习、不查表、无出口。
+        # 中继端口收到未标记帧且未配置 trunk_pvid，或标签 VID 为 0 或不在
+        # trunk_vids 允许数组中：中继策略违例，dropped，不学习、不查表、
+        # 无出口。配置了 trunk_pvid 的中继端口接收未标记帧并归入该 PVID
+        # (PVID 保证属于 trunk_vids)。
         # 未通过上述检查的事件不进入 ACL 求值，matched_acl_rule 为 null。
         pre_acl_ok = not (
             not verdict["valid"]
@@ -1499,7 +1545,10 @@ def run_scenario(scenario):
             or (tagged and access_vid is not None)
             or (
                 trunk_vids is not None
-                and (not tagged or vid not in trunk_vids)
+                and (
+                    (not tagged and trunk_pvid is None)
+                    or vid not in trunk_vids
+                )
             )
         )
 
@@ -1518,7 +1567,8 @@ def run_scenario(scenario):
         # 入口 ACL 仅对已通过帧合法性、入端口转发状态与 VLAN 入站策略检查的
         # 事件求值，并在 MAC 学习、端口安全检查与目的查表之前执行；首条命中
         # 规则决定动作，均未命中时允许。vid 匹配内部 VLAN (接入口未标记帧用
-        # access_vid，其他未标记帧用 VLAN 1)；pcp 只匹配带标签帧。
+        # access_vid，配置 trunk_pvid 的中继端口未标记帧用该 PVID，其他
+        # 未标记帧用 VLAN 1)；pcp 只匹配带标签帧。
         # 绑定冒用事件不求值 ACL，matched_acl_rule 保持 null。
         matched_acl_rule = None
         acl_drop = False
@@ -1919,6 +1969,11 @@ def build_parser():
             " 互斥) 声明中继允许承载的 VLAN：该端口只接收 VID 在允许数组中的"
             "带标签帧，未标记帧与 VID 0 或不允许的标签帧作为中继策略违例丢弃；"
             "只有内部 VLAN 被允许的中继端口才能成为出口。"
+            "端口可选 trunk_pvid (1..4094 的整数，只能与 trunk_vids 同时出现"
+            "且必须属于该允许数组) 声明中继本征 VLAN：该端口上的未标记帧"
+            "(含坏帧的结果 vid 与 VLAN 计数) 归入该 PVID 并继续既有学习、"
+            "查表、泛洪、ACL、绑定、端口安全、审计与计数流程；省略时中继端口"
+            "仍拒绝未标记帧，行为与输出逐字节不变。"
             "端口可选 dynamic_mac_limit (1..10000 的整数) 限制绑定到该端口的"
             "动态 MAC 学习数量 (不区分 VLAN，静态项不占额度)：合法帧首次学习或"
             "跨端口迁入而额度已满时该事件 dropped、无出口且不改变动态表，"
