@@ -539,15 +539,67 @@ ConfigError（退出码 3）失败，路径精确指向 `$.discipline`、`$.weig
 结果，单次时间为 O(n+queue_count)，附加内存为 O(n)；不读墙上时钟，不保留
 跨进程状态。
 
+### `stp-root`
+
+通过 `--input` 读取一个 UTF-8 JSON 快照，离线选举生成树的根桥与根端口，
+向标准输出写入单行固定键序 JSON。顶层恰好包含 `bridge`、`ports`、
+`received_bpdus` 三个字段（额外字段一律拒绝）：
+
+* `bridge` 为对象，仅含 `priority` 与 `mac`。`priority` 为 0 到 61440 之间
+  4096 的整数倍（布尔值不算整数）；`mac` 为六字节冒号分隔两位十六进制的
+  **单播**地址（首字节最低位为 0，允许全零），规范化为小写。
+* `ports` 为数组，每项仅含唯一的 `name`（非空字符串，长度上限 64）与
+  `path_cost`（1 到 2147483647 的整数，布尔值不算整数）；端口名重复为
+  ConfigError。端口数量最多 4096 个。
+* `received_bpdus` 为数组（可为空），最多 10000 条；每项引用一个已配置端口，
+  仅含 `port`、`root_priority`、`root_mac`、`root_path_cost`、
+  `sender_priority`、`sender_mac`、`sender_port_id`（额外字段一律拒绝）。
+  其中所有整数（`root_priority`、`root_path_cost`、`sender_priority`、
+  `sender_port_id`）布尔值均不算整数；`root_mac`、`sender_mac` 为六字节
+  冒号分隔两位十六进制 MAC（规范化为小写）；`port` 为字符串。
+
+选举分两步，全部比较只使用数值，不读墙上时钟：
+
+1. **根桥**：在本桥标识与各 BPDU 宣告的根桥标识之间，依次按 `priority`、
+   MAC 的 48 位数值升序取最小者为本树根桥。
+2. **根端口**：仅当本桥不是根桥时进行，且只考虑宣告了胜出根桥标识的 BPDU。
+   对每条候选依次按以下分量取最小：`root_path_cost` 加上该 BPDU 所引用本地
+   端口的 `path_cost`（总代价）、发送桥 `sender_priority`、发送桥
+   `sender_mac` 的 48 位数值、`sender_port_id`、最后是本地端口 `name`
+   （Unicode 码点序）。同一端口的多条 BPDU 均独立参与；使用严格小于，
+   结果与 BPDU、端口及字段的输入顺序无关。
+
+总路径代价不得超过 4294967295，否则以 ConfigError（退出码 3，路径指向
+`$.received_bpdus[i]`）失败。
+
+成功输出顶层按键序 `schema`、`bridge`、`root`、`is_root`、
+`root_path_cost`、`root_port` 排列，其中 `schema` 为
+`l2-switch/stp-root-v1`，`bridge` 与 `root` 均只含 `priority` 和规范化
+小写 `mac`。本桥胜出时 `is_root` 为 `true`、`root_path_cost` 为 0、
+`root_port` 为 `null`；否则 `is_root` 为 `false`，`root_path_cost` 与
+`root_port` 为胜出候选的总代价与本地端口名。
+
+文件读取、UTF-8 解码或 JSON 解析失败时以 InputError（退出码 2，错误
+`path` 为 null）失败；顶层或各对象结构错误、字段缺失或多余、整数类型/范围
+非法（含布尔值冒充整数）、重复端口名、非法 MAC、端口或 BPDU 数量超限、
+总路径代价溢出时，以 ConfigError（退出码 3）失败并给出首个错误的精确
+JSON 路径（如 `$.bridge.priority`、`$.ports[0].path_cost`、
+`$.received_bpdus[2].sender_mac`）；BPDU 的 `port` 引用了 `ports` 中不
+存在的端口名时以 StateError（退出码 5，路径
+`$.received_bpdus[i].port`）失败。全部结构与取值校验先于端口引用检查与
+输出生成；失败时标准输出为空，标准错误写入固定键序
+`(type, message, path)` 的单行 JSON。相同输入产生逐字节一致结果；单次
+处理时间为 O(p+b)，附加内存为 O(p)。
+
 ## 退出码与错误
 
 | 退出码 | 类型 | 含义 |
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、`discipline`/`weights` 搭配、帧标识或重复标识错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、`discipline`/`weights` 搭配、帧标识或重复标识错误；`stp-root` 输入的结构、字段、类型、范围、重复端口名、非法 MAC、数量超限或根路径代价溢出 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口、风暴抑制 port_limits 端口，或 `stp-root` BPDU 引用的 port) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
@@ -558,7 +610,8 @@ ConfigError（退出码 3）失败，路径精确指向 `$.discipline`、`$.weig
 * `forward` 场景事件数量：10000；静态表项数量：10000；源 MAC 绑定数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
 * `qos-schedule`：`queue_count` 为 1 到 8；`transmit_count` 为 0 到 10000；全部队列帧合计最多 10000 项；`wrr` 的 `weights` 每项为 1 到 100。
+* `stp-root`：端口最多 4096 个；BPDU 最多 10000 条；`bridge.priority` 为 0 到 61440 的 4096 倍数；每个端口 `path_cost` 为 1 到 2147483647；根路径代价上限 4294967295。
 
 ## 状态
 
-功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward、qos-schedule 五个子命令。
+功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward、qos-schedule、stp-root 六个子命令。
