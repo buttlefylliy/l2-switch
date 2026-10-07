@@ -1031,12 +1031,13 @@ ACL_FIELD_CHECKS = {
 }
 
 
-# 广播风暴抑制的字段及其规范顺序；额外字段一律拒绝。
+# 风暴抑制 (广播/组播) 的字段及其规范顺序；额外字段一律拒绝。
 # window_ms 为固定窗口长度，port_limits 把已配置物理端口名映射到该入口端口
-# 在一个窗口内允许的广播帧数；未列出的端口不受限制。
+# 在一个窗口内允许的对应类型帧数；未列出的端口不受限制。
 STORM_FIELD_ORDER = ("window_ms", "port_limits")
 STORM_FIELD_SET = frozenset(STORM_FIELD_ORDER)
 STORM_BASE = "$.broadcast_storm_control"
+MCAST_STORM_BASE = "$.multicast_storm_control"
 
 MIN_STORM_WINDOW_MS = 1
 MAX_STORM_WINDOW_MS = 9223372036854775807
@@ -1044,22 +1045,21 @@ MIN_STORM_PORT_LIMIT = 0
 MAX_STORM_PORT_LIMIT = 10000
 
 
-def validate_storm_control(storm, port_by_name):
-    """校验广播风暴抑制配置，返回 (window_ms, {端口 name: 窗口内广播帧限额})。
+def validate_storm_control(storm, port_by_name, base, field_name):
+    """校验风暴抑制配置，返回 (window_ms, {端口 name: 窗口内帧限额})。
 
+    base 为该配置的 JSON 路径，field_name 为顶层字段名，用于错误消息。
     按字段在输入中出现的顺序报告首个错误 (未知字段立即报告)，再按规范顺序
     报告缺失字段；结构、字段、整数类型 (布尔值不算整数)、范围与空
     port_limits 均为 ConfigError；port_limits 的键未引用已配置物理端口时
     为 StateError。
     """
     if not isinstance(storm, dict):
-        raise ConfigError(
-            "'broadcast_storm_control' must be an object", STORM_BASE
-        )
+        raise ConfigError("'%s' must be an object" % field_name, base)
 
     values = {}
     for field, value in storm.items():
-        path = STORM_BASE + "." + field
+        path = base + "." + field
         if field not in STORM_FIELD_SET:
             raise ConfigError("unexpected field '%s'" % field, path)
         values[field] = value
@@ -1067,11 +1067,11 @@ def validate_storm_control(storm, port_by_name):
     for field in STORM_FIELD_ORDER:
         if field not in values:
             raise ConfigError(
-                "missing field '%s'" % field, STORM_BASE + "." + field
+                "missing field '%s'" % field, base + "." + field
             )
 
     window_ms = values["window_ms"]
-    window_path = STORM_BASE + ".window_ms"
+    window_path = base + ".window_ms"
     # bool 是 int 的子类型，必须显式排除。
     if isinstance(window_ms, bool) or not isinstance(window_ms, int):
         raise ConfigError("'window_ms' must be an integer", window_path)
@@ -1083,7 +1083,7 @@ def validate_storm_control(storm, port_by_name):
         )
 
     port_limits = values["port_limits"]
-    limits_path = STORM_BASE + ".port_limits"
+    limits_path = base + ".port_limits"
     if not isinstance(port_limits, dict):
         raise ConfigError("'port_limits' must be an object", limits_path)
     if len(port_limits) == 0:
@@ -1192,7 +1192,7 @@ def validate_scenario(scenario):
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
     static_map, include_fdb_events, mirror_sources, mirror_destination,
     egress_mirror_sources, egress_mirror_destination, acl_rules, binding_map,
-    storm_control)：
+    storm_control, mcast_storm_control)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
     "trunk_pvid", "dynamic_mac_limit"} (未配置对应 VLAN 模式、本征 VLAN
@@ -1212,8 +1212,10 @@ def validate_scenario(scenario):
     binding_map 键为 (vid, 小写 mac)、值为绑定端口 name，仅校验源地址，
     未提供 mac_bindings 或其为空数组时为空映射；
     storm_control 为 (window_ms, {端口 name: 窗口内广播帧限额})，
-    未提供 broadcast_storm_control 时为 None；启用风暴抑制或老化时每个事件
-    都必须携带 time_ms，未启用二者时不得出现 time_ms。
+    未提供 broadcast_storm_control 时为 None；
+    mcast_storm_control 为 (window_ms, {端口 name: 窗口内组播帧限额})，
+    未提供 multicast_storm_control 时为 None；启用任一风暴抑制或老化时
+    每个事件都必须携带 time_ms，三者都未启用时不得出现 time_ms。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -1255,6 +1257,9 @@ def validate_scenario(scenario):
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
             seen_fields.add(field)
         elif field == "broadcast_storm_control":
+            # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
+            seen_fields.add(field)
+        elif field == "multicast_storm_control":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
             seen_fields.add(field)
         else:
@@ -1340,9 +1345,23 @@ def validate_scenario(scenario):
     storm_control = None
     if "broadcast_storm_control" in seen_fields:
         storm_control = validate_storm_control(
-            scenario["broadcast_storm_control"], port_by_name
+            scenario["broadcast_storm_control"], port_by_name,
+            STORM_BASE, "broadcast_storm_control",
         )
-    clock_enabled = aging_time_ms is not None or storm_control is not None
+
+    # 组播风暴抑制与广播抑制结构相同、独立计数，同样在 ports 之后、
+    # events 之前校验；启用后同样要求每个事件携带 time_ms。
+    mcast_storm_control = None
+    if "multicast_storm_control" in seen_fields:
+        mcast_storm_control = validate_storm_control(
+            scenario["multicast_storm_control"], port_by_name,
+            MCAST_STORM_BASE, "multicast_storm_control",
+        )
+    clock_enabled = (
+        aging_time_ms is not None
+        or storm_control is not None
+        or mcast_storm_control is not None
+    )
 
     validated_events = []
     last_time_ms = None
@@ -1405,6 +1424,7 @@ def validate_scenario(scenario):
         acl_rules,
         binding_map,
         storm_control,
+        mcast_storm_control,
     )
 
 
@@ -1424,6 +1444,7 @@ def run_scenario(scenario):
         acl_rules,
         binding_map,
         storm_control,
+        mcast_storm_control,
     ) = validate_scenario(scenario)
     mirror_enabled = mirror_sources is not None
     egress_mirror_enabled = egress_mirror_sources is not None
@@ -1439,6 +1460,14 @@ def run_scenario(scenario):
         # 每个受限端口只保留当前窗口状态 [窗口序号, 已计数广播帧数]，
         # 不保留历史窗口；附加状态不超过 port_limits 的端口数。
         storm_state = {name: [-1, 0] for name in storm_port_limits}
+    # 省略 multicast_storm_control 时功能完全关闭 (包括结果记录中的
+    # multicast_storm_controlled 键)；与广播抑制同时启用时独立计数。
+    mcast_storm_enabled = mcast_storm_control is not None
+    if mcast_storm_enabled:
+        mcast_storm_window_ms, mcast_storm_port_limits = mcast_storm_control
+        # 每个受限端口只保留当前窗口状态 [窗口序号, 已计数组播帧数]，
+        # 不保留历史窗口；附加状态不超过 port_limits 的端口数。
+        mcast_storm_state = {name: [-1, 0] for name in mcast_storm_port_limits}
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -1627,7 +1656,42 @@ def run_scenario(scenario):
                 else:
                     state[1] += 1
 
-        if not pre_acl_ok or acl_drop or binding_violation or storm_controlled:
+        # 组播风暴抑制与广播抑制在同一时点判定、独立计数：只有目的 MAC 首字节
+        # 最低位为 1 且不等于 ff:ff:ff:ff:ff:ff (即 destination_type 为
+        # multicast)，且已通过帧合法性、入口端口状态、VLAN 入站策略、源 MAC
+        # 绑定与入口 ACL 的事件才消耗该入口端口额度；广播、未知单播与前置
+        # 策略丢弃的帧不占用组播额度。窗口规则与广播抑制相同：以 time_ms 整除
+        # window_ms 的商区分，边界事件进入新窗口；未列出的端口不受限制。
+        multicast_storm_controlled = False
+        if (
+            mcast_storm_enabled
+            and pre_acl_ok
+            and not binding_violation
+            and not acl_drop
+            and verdict["destination_type"] == "multicast"
+        ):
+            mcast_storm_limit = mcast_storm_port_limits.get(ingress)
+            if mcast_storm_limit is not None:
+                window = time_ms // mcast_storm_window_ms
+                state = mcast_storm_state[ingress]
+                if state[0] != window:
+                    state[0] = window
+                    state[1] = 0
+                if state[1] >= mcast_storm_limit:
+                    # 超额：固定 dropped 且出口为空；不学习、刷新或迁移 MAC，
+                    # 不查询目的表，也不产生 learned/refreshed/moved 记录。
+                    # 事件时钟触发的老化已在上方先执行。
+                    multicast_storm_controlled = True
+                else:
+                    state[1] += 1
+
+        if (
+            not pre_acl_ok
+            or acl_drop
+            or binding_violation
+            or storm_controlled
+            or multicast_storm_controlled
+        ):
             decision = "dropped"
         else:
             # 仅在入端口 can_learn 且该 (VLAN, 规范化源 MAC) 无静态项时才
@@ -1795,6 +1859,13 @@ def run_scenario(scenario):
             # storm_controlled 位于所有既有可选字段之后，仅因超额被丢弃的
             # 广播事件为 true；省略 broadcast_storm_control 时不增加该键。
             result_record["storm_controlled"] = storm_controlled
+        if mcast_storm_enabled:
+            # multicast_storm_controlled 位于所有既有可选字段之后，仅因超额
+            # 被丢弃的组播事件为 true；省略 multicast_storm_control 时不增加
+            # 该键。
+            result_record["multicast_storm_controlled"] = (
+                multicast_storm_controlled
+            )
         results.append(result_record)
 
         if include_counters:
@@ -2022,6 +2093,12 @@ def build_parser():
             "事件才消耗额度，超额候选帧固定 dropped、空出口，不学习刷新迁移、"
             "不查目的表，结果在所有既有可选字段后追加 storm_controlled (仅超额"
             "丢弃为 true)；省略时行为与输出逐字节不变；"
+            "可选 multicast_storm_control 声明组播风暴抑制 (结构与取值规则和 "
+            "broadcast_storm_control 相同)：目的 MAC 首字节最低位为 1 且不等于 "
+            "ff:ff:ff:ff:ff:ff 的帧才消耗组播额度，广播与未知单播不占用；"
+            "两种抑制同时启用时独立计数，共用显式事件时钟；结果在所有既有可选"
+            "字段后追加 multicast_storm_controlled (仅本功能超额丢弃为 true)；"
+            "省略时行为与输出逐字节不变；"
             "无端口模式或跨进程持久化。"
             % (
                 MAX_ACL_RULES,
@@ -2036,7 +2113,7 @@ def build_parser():
             "aging_time_ms 与 time_ms 取值为 1..%d / 0..%d 的整数，"
             "time_ms 按事件顺序单调不减；不读墙上时钟。"
             "broadcast_storm_control 的 window_ms 与 port_limits 限额取值为 "
-            "1..%d / 0..%d 的整数。"
+            "1..%d / 0..%d 的整数；multicast_storm_control 沿用相同取值规则。"
             "泛洪出口按端口 name 的 Unicode 码点升序排列；"
             "相同输入的输出逐字节一致。"
             % (
@@ -2060,7 +2137,8 @@ def build_parser():
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
             "可选 aging_time_ms、static_table、mac_bindings、include_counters、"
             "include_fdb_events、ingress_mirror、egress_mirror、"
-            "ingress_acl 与 broadcast_storm_control；每个事件包含 "
+            "ingress_acl 与 broadcast_storm_control、multicast_storm_control；"
+            "每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化或风暴抑制时每个事件"
             "还需包含 time_ms"
         ),
