@@ -489,18 +489,32 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 ### `qos-schedule`
 
 通过 `--input` 读取单个出口端口的有限队列快照（UTF-8 JSON），执行严格优先级
-出队调度，向标准输出写入单行固定键序 JSON。顶层仅接受 `queue_count`、
-`queues` 与 `transmit_count` 三个字段（额外字段一律拒绝）：
+或加权轮询出队调度，向标准输出写入单行固定键序 JSON。顶层接受
+`queue_count`、`queues`、`transmit_count` 三个必填字段以及可选的
+`discipline`、`weights`（额外字段一律拒绝）：
 
 * `queue_count` 为 1 到 8 的整数（布尔值不算整数），下标即队列号。
 * `queues` 是长度恰好等于 `queue_count` 的数组；每个元素本身是数组，其下标
   对齐队列号，数组项为非空字符串帧标识，同一帧标识在全部队列中不得重复。
   全部队列合计最多 10000 项。
 * `transmit_count` 为 0 到 10000 的整数（布尔值不算整数）。
+* 可选 `discipline` 为字符串，只接受 `strict` 或 `wrr`，省略时等同
+  `strict`。选择 `wrr` 时必须提供 `weights`；选择 `strict` 或省略
+  `discipline` 时不得提供 `weights`。
+* `weights` 是长度恰好等于 `queue_count` 的整数数组，每项对应同下标队列，
+  取值为 1 到 100（布尔值不算整数）。
 
-调度规则：较大的队列号代表更高优先级；每次从当前最高的非空队列队首取出一项，
-同一队列保持先入先出，直到达到 `transmit_count` 或所有队列为空。
-`transmit_count` 大于待发送总数时只发送现有项目。
+`strict`（含省略 `discipline`）调度规则：较大的队列号代表更高优先级；每次
+从当前最高的非空队列队首取出一项，同一队列保持先入先出，直到达到
+`transmit_count` 或所有队列为空。`transmit_count` 大于待发送总数时只发送
+现有项目。
+
+`wrr` 调度规则：从最高队列号开始，按队列号递减访问，访问到零后再从最高队列
+开始下一轮。每次访问非空队列时，最多连续发送该队列权重指定数量的队首帧，并
+保持队内先进先出；队列不足本次配额时只发送现有帧，剩余配额不转借也不累计，
+空队列直接跳过。调度在已发送数量达到 `transmit_count` 或所有队列为空时停止，
+`transmit_count` 大于待发送总数时只发送现有帧。每次调用都从最高队列开始，不
+读取时间，也不保留跨调用游标。
 
 成功时输出单行固定键序 JSON，顶层依次为 `schema`、`transmitted`、
 `remaining`，其中 `schema` 为 `l2-switch/qos-schedule-v1`：
@@ -514,9 +528,14 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 `path` 为 null）失败；顶层不是对象、字段缺失或多余、`queue_count` 或
 `transmit_count` 类型/范围非法（含布尔值冒充整数）、`queues` 不是数组或
 长度不等于 `queue_count`、队列元素不是数组、帧标识不是非空字符串或标识重复、
-以及合计帧数超过 10000 时，都以 ConfigError（退出码 3）失败；错误 JSON 保持
-固定键序 `(type, message, path)` 并给出首个错误的精确路径（如
-`$.queues[2][0]`）。失败时标准输出不写入部分结果。相同输入产生逐字节一致
+以及合计帧数超过 10000 时，都以 ConfigError（退出码 3）失败。`discipline`
+类型或取值错误、`wrr` 缺少 `weights`、`strict`（含省略）携带 `weights`，
+以及 `weights` 类型、长度、元素类型（含布尔值冒充整数）或范围非法时，同样以
+ConfigError（退出码 3）失败，路径精确指向 `$.discipline`、`$.weights` 或
+对应数组元素（如 `$.weights[2]`）。程序在写出标准输出前完成整个快照校验；
+错误 JSON 保持固定键序 `(type, message, path)` 并给出首个错误的精确路径（如
+`$.queues[2][0]`）。失败时标准输出不写入部分结果。省略 `discipline` 与
+`weights` 的既有三字段输入，其结果与此前逐字节一致；相同输入产生逐字节一致
 结果，单次时间为 O(n+queue_count)，附加内存为 O(n)；不读墙上时钟，不保留
 跨进程状态。
 
@@ -526,7 +545,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、帧标识或重复标识错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误；`qos-schedule` 输入的结构、字段、范围、数组长度、`discipline`/`weights` 搭配、帧标识或重复标识错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
 
@@ -538,7 +557,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 * 端口数量：4096；单个端口 name 长度：64 个字符。
 * `forward` 场景事件数量：10000；静态表项数量：10000；源 MAC 绑定数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
-* `qos-schedule`：`queue_count` 为 1 到 8；`transmit_count` 为 0 到 10000；全部队列帧合计最多 10000 项。
+* `qos-schedule`：`queue_count` 为 1 到 8；`transmit_count` 为 0 到 10000；全部队列帧合计最多 10000 项；`wrr` 的 `weights` 每项为 1 到 100。
 
 ## 状态
 
