@@ -1441,13 +1441,103 @@ def acl_rule_matches(rule, src_mac, dst_mac, vid, ether_type, pcp):
     return True
 
 
+# QoS 队列分类配置的字段及其规范顺序；额外字段一律拒绝。
+# queue_count 声明出口队列数量，pcp_to_queue 把 PCP 0..7 映射到队列号，
+# untagged_queue 为未标记帧的队列号；队列号取值均为 0..queue_count-1。
+QOS_FIELD_ORDER = ("queue_count", "pcp_to_queue", "untagged_queue")
+QOS_FIELD_SET = frozenset(QOS_FIELD_ORDER)
+QOS_BASE = "$.qos_queues"
+
+MIN_QOS_QUEUE_COUNT = 1
+MAX_QOS_QUEUE_COUNT = 8
+QOS_PCP_TO_QUEUE_LEN = 8
+
+
+def validate_qos_queues(qos):
+    """校验 QoS 队列分类配置，返回 (queue_count, pcp_to_queue, untagged_queue)。
+
+    只做确定性分类与审计，不引入缓存深度、丢弃算法或出队调度。
+    按字段在输入中出现的顺序报告未知字段，再按规范顺序报告缺失字段；
+    queue_count、pcp_to_queue (类型、长度与逐元素) 与 untagged_queue 的
+    类型或范围错误均为 ConfigError (布尔值不算整数)，path 精确指向对应
+    字段或数组元素。
+    """
+    if not isinstance(qos, dict):
+        raise ConfigError("'qos_queues' must be an object", QOS_BASE)
+
+    values = {}
+    for field, value in qos.items():
+        path = QOS_BASE + "." + field
+        if field not in QOS_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        values[field] = value
+
+    for field in QOS_FIELD_ORDER:
+        if field not in values:
+            raise ConfigError(
+                "missing field '%s'" % field, QOS_BASE + "." + field
+            )
+
+    queue_count = values["queue_count"]
+    count_path = QOS_BASE + ".queue_count"
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(queue_count, bool) or not isinstance(queue_count, int):
+        raise ConfigError("'queue_count' must be an integer", count_path)
+    if queue_count < MIN_QOS_QUEUE_COUNT or queue_count > MAX_QOS_QUEUE_COUNT:
+        raise ConfigError(
+            "'queue_count' must be between %d and %d"
+            % (MIN_QOS_QUEUE_COUNT, MAX_QOS_QUEUE_COUNT),
+            count_path,
+        )
+
+    pcp_to_queue = values["pcp_to_queue"]
+    map_path = QOS_BASE + ".pcp_to_queue"
+    if not isinstance(pcp_to_queue, list):
+        raise ConfigError("'pcp_to_queue' must be an array", map_path)
+    if len(pcp_to_queue) != QOS_PCP_TO_QUEUE_LEN:
+        raise ConfigError(
+            "'pcp_to_queue' must contain exactly %d elements"
+            % QOS_PCP_TO_QUEUE_LEN,
+            map_path,
+        )
+    checked_map = []
+    for index, item in enumerate(pcp_to_queue):
+        item_path = "%s[%d]" % (map_path, index)
+        # bool 是 int 的子类型，必须显式排除。
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(
+                "'pcp_to_queue' elements must be integers", item_path
+            )
+        if item < 0 or item > queue_count - 1:
+            raise ConfigError(
+                "'pcp_to_queue' elements must be between 0 and %d"
+                % (queue_count - 1),
+                item_path,
+            )
+        checked_map.append(item)
+
+    untagged_queue = values["untagged_queue"]
+    untagged_path = QOS_BASE + ".untagged_queue"
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(untagged_queue, bool) or not isinstance(untagged_queue, int):
+        raise ConfigError("'untagged_queue' must be an integer", untagged_path)
+    if untagged_queue < 0 or untagged_queue > queue_count - 1:
+        raise ConfigError(
+            "'untagged_queue' must be between 0 and %d" % (queue_count - 1),
+            untagged_path,
+        )
+
+    return queue_count, checked_map, untagged_queue
+
+
 def validate_scenario(scenario):
     """先完整校验场景再处理；任何结构、字段、引用错误都在处理首个事件前抛出。
 
     返回 (port_by_name, validated_events, aging_time_ms, include_counters,
     static_map, include_fdb_events, mirror_sources, mirror_destination,
     egress_mirror_sources, egress_mirror_destination, acl_rules, binding_map,
-    storm_control, multicast_storm_control, unknown_unicast_storm_control)：
+    storm_control, multicast_storm_control, unknown_unicast_storm_control,
+    qos_queues)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
     "trunk_pvid", "hybrid_vids", "hybrid_pvid", "hybrid_untagged_vids",
@@ -1474,6 +1564,8 @@ def validate_scenario(scenario):
     unknown_unicast_storm_control 为 (window_ms, {端口 name: 窗口内未知单播
     帧限额})，未提供 unknown_unicast_storm_control 时为 None；启用任一风暴
     抑制或老化时每个事件都必须携带 time_ms，都未启用时不得出现 time_ms。
+    qos_queues 为 (queue_count, pcp_to_queue, untagged_queue)，
+    未提供 qos_queues 时为 None。
     """
     if not isinstance(scenario, dict):
         raise ConfigError("top-level scenario must be an object", "$")
@@ -1522,6 +1614,9 @@ def validate_scenario(scenario):
             seen_fields.add(field)
         elif field == "unknown_unicast_storm_control":
             # 记录字段出现；结构与引用校验在 ports 校验完成后进行。
+            seen_fields.add(field)
+        elif field == "qos_queues":
+            # 记录字段出现；结构校验在 ports 校验完成后进行。
             seen_fields.add(field)
         else:
             raise ConfigError("unexpected field '%s'" % field, path)
@@ -1635,6 +1730,11 @@ def validate_scenario(scenario):
             scenario["unknown_unicast_storm_control"], port_by_name,
             "unknown_unicast_storm_control", UNKNOWN_UNICAST_STORM_BASE,
         )
+
+    # QoS 队列分类不引用端口，同样在 ports 之后、events 之前校验。
+    qos_queues = None
+    if "qos_queues" in seen_fields:
+        qos_queues = validate_qos_queues(scenario["qos_queues"])
     clock_enabled = (
         aging_time_ms is not None
         or storm_control is not None
@@ -1705,6 +1805,7 @@ def validate_scenario(scenario):
         storm_control,
         multicast_storm_control,
         unknown_unicast_storm_control,
+        qos_queues,
     )
 
 
@@ -1726,6 +1827,7 @@ def run_scenario(scenario):
         storm_control,
         multicast_storm_control,
         unknown_unicast_storm_control,
+        qos_queues,
     ) = validate_scenario(scenario)
     mirror_enabled = mirror_sources is not None
     egress_mirror_enabled = egress_mirror_sources is not None
@@ -1772,6 +1874,12 @@ def run_scenario(scenario):
         unknown_unicast_storm_state = {
             name: [-1, 0] for name in unknown_unicast_storm_port_limits
         }
+    # 省略 qos_queues 时功能完全关闭 (包括结果记录中的 egress_queues 键)；
+    # 只做确定性的队列分类与审计，不引入缓存深度、丢弃算法或出队调度，
+    # 除结果数组外不保留跨事件队列状态。
+    qos_enabled = qos_queues is not None
+    if qos_enabled:
+        _, qos_pcp_to_queue, qos_untagged_queue = qos_queues
 
     # 可转发出口集合，按 name 的 Unicode 码点升序排列 (Python 字符串即码点序)。
     flood_ports = sorted(
@@ -2210,6 +2318,21 @@ def run_scenario(scenario):
                         {"port": name, "tagged": True, "vlan": action_vlan}
                     )
 
+        # QoS 队列分类：对最终 egress_ports 中的每个普通出口，带 802.1Q 标签
+        # 的帧用 ACL 重标记后的 effective_pcp 查询 pcp_to_queue，未标记帧使用
+        # untagged_queue；与 egress_ports 同序且一一对应。dropped、filtered
+        # 或无出口事件为空数组。入口/出口镜像副本不参与分类；混合端口出站
+        # 剥除标签也不改变按内部帧优先级得到的分类。分类只读取本事件的
+        # 转发结果，时间与实际出口数线性相关，不改变任何既有状态。
+        if qos_enabled:
+            if tagged:
+                qos_queue = qos_pcp_to_queue[effective_pcp]
+            else:
+                qos_queue = qos_untagged_queue
+            egress_queues = [
+                {"port": name, "queue": qos_queue} for name in egress
+            ]
+
         result_record = {
             "event": index,
             "vid": vid,
@@ -2258,6 +2381,10 @@ def run_scenario(scenario):
             result_record["unknown_unicast_storm_controlled"] = (
                 unknown_unicast_storm_controlled
             )
+        if qos_enabled:
+            # egress_queues 位于所有既有可选字段之后：每项固定键序 port、queue，
+            # 与 egress_ports 同序且一一对应；省略 qos_queues 时不增加该键。
+            result_record["egress_queues"] = egress_queues
         results.append(result_record)
 
         if include_counters:
@@ -2545,6 +2672,15 @@ def build_parser():
             "不查目的表，结果在所有既有可选字段后追加 "
             "unknown_unicast_storm_controlled (仅超额丢弃为 true)；省略时行为"
             "与输出逐字节不变；"
+            "可选 qos_queues 声明出口队列分类 (仅含 queue_count、pcp_to_queue "
+            "与 untagged_queue)：queue_count 为 1..8 的整数，pcp_to_queue 为"
+            "恰好 8 个整数的数组 (下标为 PCP 0..7)，数组值与 untagged_queue "
+            "均为 0..queue_count-1 的整数 (布尔值不算整数)；启用后每个普通"
+            "出口按帧分类，带标签帧用 ACL 重标记后的 effective_pcp 查 "
+            "pcp_to_queue，未标记帧用 untagged_queue，结果在所有既有可选字段"
+            "后追加 egress_queues (每项含 port、queue，与 egress_ports 同序"
+            "且一一对应，无出口时为空数组)；只做分类与审计，不改变转发决定，"
+            "省略时行为与输出逐字节不变；"
             "无端口模式或跨进程持久化。"
             % (
                 MAX_ACL_RULES,
@@ -2584,8 +2720,8 @@ def build_parser():
             "UTF-8 JSON 场景文件路径，顶层包含 ports 数组与 events 数组，"
             "可选 aging_time_ms、static_table、mac_bindings、include_counters、"
             "include_fdb_events、ingress_mirror、egress_mirror、"
-            "ingress_acl、broadcast_storm_control、multicast_storm_control 与 "
-            "unknown_unicast_storm_control；每个事件包含 "
+            "ingress_acl、broadcast_storm_control、multicast_storm_control、"
+            "unknown_unicast_storm_control 与 qos_queues；每个事件包含 "
             "ingress_port 与完整 frame 描述，启用老化或风暴抑制时每个事件"
             "还需包含 time_ms"
         ),
