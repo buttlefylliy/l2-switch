@@ -65,6 +65,36 @@ VLAN；`hybrid_untagged_vids` 为 `hybrid_vids` 的不重复子集（可为空
 类型或范围错误以 ConfigError（退出码 3，路径
 `$.ports[i].dynamic_mac_limit`）失败。
 
+### `config-diff`
+
+按命令行参数顺序读取 before 和 after 两个 UTF-8 JSON 端口配置文件
+（`python l2_switch.py config-diff BEFORE AFTER`），两侧沿用 `ports`
+子命令的全部字段、校验规则、数量上限（每侧最多 4096 个端口）、排序和
+派生状态语义。程序先完整读取两份配置（输入阶段），再完整校验两份配置
+（配置阶段），全部成功后才比较校验后的规范化快照：比较不受原始 JSON
+字段顺序影响，VLAN 数组仅输入顺序不同或可选字段在两侧都省略时不产生
+差异。
+
+成功时向标准输出写入一行固定键序 JSON，顶层依次为 `schema`
+（`l2-switch/config-diff-v1`）、`added_ports`、`removed_ports`、
+`changed_ports`、`unchanged_count`。`added_ports` 与 `removed_ports`
+分别保存 after 独有和 before 独有端口的完整规范化快照（端口改名视为
+删除加新增，不推断重命名）。同名端口只要任一公开快照字段不同就进入
+`changed_ports`，每项依次包含 `name`、`before`、`after`、
+`changed_fields`：`before` 与 `after` 保存完整快照，`changed_fields`
+先按 `ports` 的规范字段顺序列出实际变化的字段，再在其后列出发生变化的
+`can_forward`、`can_learn` 派生字段。三个数组都按 name 的 Unicode 码点
+升序排列，`unchanged_count` 只统计同名且快照完全相同的端口；两侧语义
+相同时三个数组为空，相同输入重复执行的输出逐字节一致。
+
+任一文件读取、UTF-8 解码或 JSON 解析失败时以 InputError（退出码 2）
+失败；端口结构、字段、类型、范围或互斥关系非法时以 ConfigError
+（退出码 3）失败，错误路径分别置于 `$.before` 或 `$.after` 下以标明
+失败侧（例如 `$.before.ports[0].trunk_vids`）。任一侧失败时标准输出
+不写入部分结果，标准错误继续使用固定键序 `(type, message, path)` 的
+单行错误 JSON。单次比较最多处理每侧 4096 个端口，时间上界为
+O(n log n)，附加内存为 O(n)，不联网、不读墙上时钟。
+
 ### `frame`
 
 读取 UTF-8 JSON 单帧描述，做离线合法性判定 (runt/oversize/bad_fcs 等)，
@@ -434,4 +464,4 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 
 ## 状态
 
-功能按增量需求持续构建；当前包含 ports、frame、forward 三个子命令。
+功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward 四个子命令。

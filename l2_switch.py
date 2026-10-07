@@ -2,6 +2,7 @@
 """l2-switch: 二层以太网交换的行为仿真与配置框架。
 
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
+两份端口配置规范化快照的确定性比较 (config-diff 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
 以及场景内的动态 MAC 学习、静态表项、查表与转发 (forward 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
@@ -540,6 +541,104 @@ def cmd_ports(args):
         emit_error("ConfigError", exc.message, exc.path)
         return 3
 
+    sys.stdout.buffer.write(
+        (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    return 0
+
+
+# config-diff 输出的版本标识。
+DIFF_SCHEMA = "l2-switch/config-diff-v1"
+
+# 区分"字段缺失"与"字段值为 null"的占位对象，只参与相等性比较。
+_MISSING = object()
+
+
+def diff_snapshots(before_ports, after_ports):
+    """比较两侧按 name 升序排列的规范化端口快照。
+
+    返回 (added_ports, removed_ports, changed_ports, unchanged_count)：
+    added_ports 为 after 独有端口的完整快照，removed_ports 为 before 独有
+    端口的完整快照 (端口改名视为删除加新增，不推断重命名)；同名端口任一
+    公开快照字段不同即进入 changed_ports，每项依次包含 name、before、
+    after、changed_fields，changed_fields 先按规范字段顺序列出实际变化的
+    配置字段，再列出发生变化的 can_forward、can_learn 派生字段；
+    unchanged_count 只统计同名且快照完全相同的端口。三个数组均按 name 的
+    Unicode 码点升序 (输入快照已按 name 排序，按序遍历即保持该顺序)。
+    """
+    before_by_name = {port["name"]: port for port in before_ports}
+    after_by_name = {port["name"]: port for port in after_ports}
+
+    added_ports = [
+        port for port in after_ports if port["name"] not in before_by_name
+    ]
+    removed_ports = [
+        port for port in before_ports if port["name"] not in after_by_name
+    ]
+
+    changed_ports = []
+    unchanged_count = 0
+    for before_port in before_ports:
+        name = before_port["name"]
+        after_port = after_by_name.get(name)
+        if after_port is None:
+            continue
+        if before_port == after_port:
+            unchanged_count += 1
+            continue
+        changed_fields = []
+        for field in FIELD_ORDER:
+            if before_port.get(field, _MISSING) != after_port.get(
+                field, _MISSING
+            ):
+                changed_fields.append(field)
+        for field in ("can_forward", "can_learn"):
+            if before_port[field] != after_port[field]:
+                changed_fields.append(field)
+        changed_ports.append(
+            {
+                "name": name,
+                "before": before_port,
+                "after": after_port,
+                "changed_fields": changed_fields,
+            }
+        )
+
+    return added_ports, removed_ports, changed_ports, unchanged_count
+
+
+def cmd_config_diff(args):
+    # 先完整读取两份配置 (输入阶段)，再完整校验两份配置 (配置阶段)，
+    # 全部成功后才比较；任一侧失败时标准输出不写入部分结果。
+    configs = []
+    for path in (args.before, args.after):
+        try:
+            configs.append(read_config(path))
+        except ValueError as exc:
+            emit_error("InputError", str(exc))
+            return 2
+
+    snapshots = []
+    for side, config in zip(("before", "after"), configs):
+        try:
+            snapshots.append(validate(config))
+        except ConfigError as exc:
+            # 错误路径改挂到 $.before 或 $.after 下以标明失败侧。
+            emit_error(
+                "ConfigError", exc.message, "$." + side + exc.path[1:]
+            )
+            return 3
+
+    added_ports, removed_ports, changed_ports, unchanged_count = (
+        diff_snapshots(snapshots[0]["ports"], snapshots[1]["ports"])
+    )
+    result = {
+        "schema": DIFF_SCHEMA,
+        "added_ports": added_ports,
+        "removed_ports": removed_ports,
+        "changed_ports": changed_ports,
+        "unchanged_count": unchanged_count,
+    }
     sys.stdout.buffer.write(
         (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
     )
@@ -2243,7 +2342,8 @@ def build_parser():
         prog="l2_switch.py",
         description=(
             "l2-switch: 二层以太网交换的行为仿真与配置框架。"
-            "支持物理端口配置校验与确定性状态快照、以太帧的离线合法性判定，"
+            "支持物理端口配置校验与确定性状态快照、两份端口配置规范化快照的"
+            "确定性比较、以太帧的离线合法性判定，"
             "以及场景内的动态 MAC 学习、查表与转发。"
         ),
         epilog=(
@@ -2274,6 +2374,40 @@ def build_parser():
         help="UTF-8 JSON 配置文件路径，顶层包含 ports 数组",
     )
     ports_parser.set_defaults(func=cmd_ports)
+
+    diff_parser = subparsers.add_parser(
+        "config-diff",
+        help="比较两份端口配置的规范化快照并输出确定性差异",
+        description=(
+            "按命令行参数顺序读取 before 和 after 两个 UTF-8 JSON 端口配置"
+            "文件，沿用 ports 子命令的全部字段、校验规则、数量上限、排序和"
+            "派生状态语义，先完整读取并校验两份配置，再比较校验后的规范化"
+            "快照 (不受原始 JSON 字段顺序影响，VLAN 数组仅输入顺序不同或"
+            "可选字段在两侧都省略时不产生差异)，并向标准输出写入单行固定"
+            "键序 JSON：顶层依次为 schema、added_ports、removed_ports、"
+            "changed_ports、unchanged_count。同名端口任一公开快照字段不同"
+            "即进入 changed_ports (每项依次含 name、before、after、"
+            "changed_fields，changed_fields 先按规范字段顺序列出变化的配置"
+            "字段，再列出变化的 can_forward、can_learn 派生字段)；端口改名"
+            "视为删除加新增。三个数组按 name 的 Unicode 码点升序排列。"
+        ),
+        epilog=(
+            "限制: 每侧端口数量上限为 %d；单个端口 name 长度上限为 %d 个字符。"
+            "相同输入重复执行的输出逐字节一致。"
+            % (MAX_PORTS, MAX_PORT_NAME_LEN)
+        ),
+    )
+    diff_parser.add_argument(
+        "before",
+        metavar="BEFORE",
+        help="UTF-8 JSON 端口配置文件路径 (比较基准侧)，顶层包含 ports 数组",
+    )
+    diff_parser.add_argument(
+        "after",
+        metavar="AFTER",
+        help="UTF-8 JSON 端口配置文件路径 (比较目标侧)，顶层包含 ports 数组",
+    )
+    diff_parser.set_defaults(func=cmd_config_diff)
 
     frame_parser = subparsers.add_parser(
         "frame",
