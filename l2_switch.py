@@ -3,7 +3,8 @@
 
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
-以及场景内的动态 MAC 学习、静态表项、查表与转发 (forward 子命令)。
+场景内的动态 MAC 学习、静态表项、查表与转发 (forward 子命令)，
+以及单个出口端口队列快照的严格优先级调度 (qos-schedule 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -25,6 +26,7 @@ MAX_ACL_RULES = 4096
 SCHEMA = "l2-switch/ports-v1"
 FRAME_SCHEMA = "l2-switch/frame-v1"
 FORWARD_SCHEMA = "l2-switch/forward-v1"
+QOS_SCHEDULE_SCHEMA = "l2-switch/qos-schedule-v1"
 CONFIG_DIFF_SCHEMA = "l2-switch/config-diff-v1"
 # 未标记帧归入 VLAN 1；带标签帧按 vid 隔离，vid 0 也是独立域。
 UNTAGGED_VID = 1
@@ -1459,6 +1461,11 @@ MIN_QOS_QUEUE_COUNT = 1
 MAX_QOS_QUEUE_COUNT = 8
 QOS_PCP_TO_QUEUE_LEN = 8
 
+# qos-schedule 输入的有限上限。
+MIN_TRANSMIT_COUNT = 0
+MAX_TRANSMIT_COUNT = 10000
+MAX_SCHEDULE_FRAMES = 10000
+
 
 def validate_qos_queues(qos):
     """校验 QoS 队列分类配置，返回 (queue_count, pcp_to_queue, untagged_queue)。
@@ -2543,6 +2550,189 @@ def cmd_forward(args):
     return 0
 
 
+def read_schedule_input(path):
+    """读取并解析 UTF-8 JSON 队列快照；读取/解码/解析失败抛 ValueError。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        # 使用固定消息，避免平台/locale 文本差异影响确定性。
+        raise ValueError("cannot read input file")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("input file is not valid UTF-8")
+    try:
+        return json.loads(text)
+    except (ValueError, RecursionError):
+        # JSONDecodeError 是 ValueError 的子类；超长整数等解析限制同样归为输入错误。
+        raise ValueError("input file is not valid JSON")
+
+
+# qos-schedule 输入顶层字段及其规范顺序；额外字段一律拒绝。
+SCHEDULE_FIELD_ORDER = ("queue_count", "queues", "transmit_count")
+SCHEDULE_FIELD_SET = frozenset(SCHEDULE_FIELD_ORDER)
+
+
+def validate_qos_schedule(snapshot):
+    """校验单个出口端口的队列快照，返回 (queue_count, queues, transmit_count)。
+
+    按顶层键在输入中出现的顺序报告未知字段，再按规范顺序报告缺失字段；
+    随后依次校验 queue_count (1..8 的整数)、queues (长度恰为 queue_count
+    的数组，每项为非空字符串帧标识数组，同一标识跨全部队列不得重复，合计
+    不超过 10000 项) 与 transmit_count (0..10000 的整数)。布尔值不算整数。
+    任何结构、字段、类型、范围、长度或标识错误均为 ConfigError，path 精确
+    指向对应字段、队列或数组元素。
+    """
+    if not isinstance(snapshot, dict):
+        raise ConfigError("top-level input must be an object", "$")
+
+    values = {}
+    for field, value in snapshot.items():
+        path = "$." + field
+        if field not in SCHEDULE_FIELD_SET:
+            raise ConfigError("unexpected field '%s'" % field, path)
+        values[field] = value
+
+    for field in SCHEDULE_FIELD_ORDER:
+        if field not in values:
+            raise ConfigError("missing field '%s'" % field, "$." + field)
+
+    queue_count = values["queue_count"]
+    count_path = "$.queue_count"
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(queue_count, bool) or not isinstance(queue_count, int):
+        raise ConfigError("'queue_count' must be an integer", count_path)
+    if queue_count < MIN_QOS_QUEUE_COUNT or queue_count > MAX_QOS_QUEUE_COUNT:
+        raise ConfigError(
+            "'queue_count' must be between %d and %d"
+            % (MIN_QOS_QUEUE_COUNT, MAX_QOS_QUEUE_COUNT),
+            count_path,
+        )
+
+    queues = values["queues"]
+    queues_path = "$.queues"
+    if not isinstance(queues, list):
+        raise ConfigError("'queues' must be an array", queues_path)
+    if len(queues) != queue_count:
+        raise ConfigError(
+            "'queues' must contain exactly %d elements" % queue_count, queues_path
+        )
+
+    checked_queues = []
+    total_frames = 0
+    seen_ids = set()
+    for queue_index, queue in enumerate(queues):
+        queue_path = "%s[%d]" % (queues_path, queue_index)
+        if not isinstance(queue, list):
+            raise ConfigError("'queues' elements must be arrays", queue_path)
+        checked_queue = []
+        for item_index, frame_id in enumerate(queue):
+            item_path = "%s[%d]" % (queue_path, item_index)
+            if not isinstance(frame_id, str):
+                raise ConfigError(
+                    "'queues' frame ids must be non-empty strings", item_path
+                )
+            if len(frame_id) == 0:
+                raise ConfigError(
+                    "'queues' frame ids must be non-empty strings", item_path
+                )
+            if frame_id in seen_ids:
+                # 同一帧标识不得在任何队列中重复；路径指向第二次出现处。
+                raise ConfigError(
+                    "'queues' must not contain duplicate frame ids", item_path
+                )
+            seen_ids.add(frame_id)
+            checked_queue.append(frame_id)
+        total_frames += len(checked_queue)
+        checked_queues.append(checked_queue)
+
+    if total_frames > MAX_SCHEDULE_FRAMES:
+        raise ConfigError(
+            "total number of frames exceeds maximum of %d"
+            % MAX_SCHEDULE_FRAMES,
+            queues_path,
+        )
+
+    transmit_count = values["transmit_count"]
+    transmit_path = "$.transmit_count"
+    # bool 是 int 的子类型，必须显式排除。
+    if isinstance(transmit_count, bool) or not isinstance(transmit_count, int):
+        raise ConfigError("'transmit_count' must be an integer", transmit_path)
+    if transmit_count < MIN_TRANSMIT_COUNT or transmit_count > MAX_TRANSMIT_COUNT:
+        raise ConfigError(
+            "'transmit_count' must be between %d and %d"
+            % (MIN_TRANSMIT_COUNT, MAX_TRANSMIT_COUNT),
+            transmit_path,
+        )
+
+    return queue_count, checked_queues, transmit_count
+
+
+def schedule_queues(snapshot):
+    """校验队列快照并执行严格优先级调度，返回固定键序的结果对象。
+
+    较大的队列号代表更高优先级：每次从当前最高的非空队列队首取出一项，
+    同一队列保持先入先出，直到达到 transmit_count 或所有队列为空。
+    使用只降不升的最高队列游标与每队列队首游标，调度时间为
+    O(n+queue_count)，除输出外附加内存为 O(n) (帧标识均引用已解析输入，
+    不复制字符串)。
+    """
+    queue_count, queues, transmit_count = validate_qos_schedule(snapshot)
+
+    # 每个队列的队首游标；帧标识只引用输入列表中的字符串，不额外复制。
+    heads = [0] * queue_count
+    # 最高非空队列游标：队列只出不进，游标只降不升，全程总下移次数不超过
+    # queue_count；初始向下扫描空队列计入 O(queue_count)。
+    highest = queue_count - 1
+
+    transmitted = []
+    sequence = 0
+    while sequence < transmit_count:
+        while highest >= 0 and heads[highest] == len(queues[highest]):
+            highest -= 1
+        if highest < 0:
+            # 所有队列已空；transmit_count 大于待发送总数时只发送现有项目。
+            break
+        frame_id = queues[highest][heads[highest]]
+        heads[highest] += 1
+        transmitted.append(
+            {"sequence": sequence, "queue": highest, "frame_id": frame_id}
+        )
+        sequence += 1
+
+    # remaining 按队列号升序保留全部队列，空队列也不省略。
+    remaining = [
+        {"queue": queue_index, "frame_ids": queues[queue_index][heads[queue_index]:]}
+        for queue_index in range(queue_count)
+    ]
+
+    return {
+        "schema": QOS_SCHEDULE_SCHEMA,
+        "transmitted": transmitted,
+        "remaining": remaining,
+    }
+
+
+def cmd_qos_schedule(args):
+    try:
+        snapshot = read_schedule_input(args.input)
+    except ValueError as exc:
+        emit_error("InputError", str(exc))
+        return 2
+
+    try:
+        result = schedule_queues(snapshot)
+    except ConfigError as exc:
+        emit_error("ConfigError", exc.message, exc.path)
+        return 3
+
+    sys.stdout.buffer.write(
+        (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="l2_switch.py",
@@ -2796,6 +2986,36 @@ def build_parser():
         ),
     )
     forward_parser.set_defaults(func=cmd_forward)
+
+    schedule_parser = subparsers.add_parser(
+        "qos-schedule",
+        help="对单个出口端口的有限队列快照执行严格优先级调度",
+        description=(
+            "读取 UTF-8 JSON 队列快照 (仅含 queue_count、queues 与 "
+            "transmit_count)，先完整校验，再执行严格优先级调度：较大的队列号"
+            "代表更高优先级，每次从当前最高的非空队列队首取出一项，同一队列"
+            "保持先入先出，直到达到 transmit_count 或所有队列为空。成功时向"
+            "标准输出写入单行固定键序 JSON (schema、transmitted、remaining)。"
+        ),
+        epilog=(
+            "限制: queue_count 为 1..8 的整数；transmit_count 为 0..%d 的整数；"
+            "全部队列合计最多 %d 项，同一帧标识不得重复。布尔值不算整数。"
+            "相同输入的输出逐字节一致；时间为 O(n+queue_count)。"
+            % (MAX_TRANSMIT_COUNT, MAX_SCHEDULE_FRAMES)
+        ),
+    )
+    schedule_parser.add_argument(
+        "--input",
+        required=True,
+        metavar="FILE",
+        help=(
+            "UTF-8 JSON 队列快照文件路径，顶层仅包含 queue_count (1..8)、"
+            "queues (长度等于 queue_count 的数组，每项为非空字符串帧标识数组，"
+            "同一标识不得重复) 与 transmit_count (0..%d)"
+            % MAX_TRANSMIT_COUNT
+        ),
+    )
+    schedule_parser.set_defaults(func=cmd_qos_schedule)
 
     return parser
 

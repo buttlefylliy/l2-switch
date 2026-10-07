@@ -486,13 +486,50 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     附加计数状态以端口数乘队列数为上界。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
+### `qos-schedule`
+
+从 `--input` 读取单个出口端口的有限队列快照（UTF-8 JSON），对其执行严格
+优先级出队调度；不读墙上时钟、不保留跨进程状态，也不改变 `forward` 当前
+仅分类与计数的语义。顶层仅接受三个字段，额外字段一律拒绝：
+
+* `queue_count`：1 到 8 的整数（布尔值不算整数），声明队列数量。
+* `queues`：长度恰等于 `queue_count` 的数组，下标即队列号；每项是由非空
+  字符串帧标识组成的数组（队首在前），同一帧标识在全部队列中不得重复，
+  全部队列合计最多 10000 项。空队列用空数组表示。
+* `transmit_count`：0 到 10000 的整数（布尔值不算整数），声明本次最多发送
+  的帧数。
+
+校验全部成功后才调度：较大的队列号代表更高优先级，每次从当前最高的非空
+队列队首取出一项，同一队列保持先入先出，直到达到 `transmit_count` 或所有
+队列为空；`transmit_count` 大于待发送总数时只发送现有项目。
+
+成功时向标准输出写入一行固定键序 JSON，顶层依次为 `schema`、
+`transmitted`、`remaining`：
+
+* `schema` 固定为 `l2-switch/qos-schedule-v1`。
+* `transmitted` 按发送次序记录，每项固定依次含 `sequence`（从 0 连续递增）、
+  `queue`（取出该帧的队列号）与 `frame_id`；没有发送任何帧时为空数组。
+* `remaining` 按队列号升序保留全部队列（空队列也不省略），每项固定依次含
+  `queue` 与 `frame_ids`（该队列未发送的帧标识，保持原有先入先出次序）。
+
+相同输入重复执行逐字节一致；单次时间为 O(n+queue_count)，附加内存为
+O(n)。
+
+文件读取、UTF-8 解码或 JSON 解析失败时以 InputError（退出码 2）失败；
+顶层结构、字段缺失或多余、`queue_count`/`transmit_count` 的类型或范围、
+`queues` 类型或长度、队列元素不是数组、帧标识不是非空字符串、同一标识
+重复，或全部队列帧数超过 10000 时，以 ConfigError（退出码 3）失败。
+错误 JSON 保持固定键序 `(type, message, path)` 并给出首个错误的精确路径
+（如 `$.queue_count`、`$.queues`、`$.queues[2][0]`、
+`$.transmit_count`；顶层非对象时为 `$`）。失败时标准输出不写入部分结果。
+
 ## 退出码与错误
 
 | 退出码 | 类型 | 含义 |
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`include_qos_counters`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues`，或 `qos-schedule` 输入的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
 
@@ -504,7 +541,8 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 * 端口数量：4096；单个端口 name 长度：64 个字符。
 * `forward` 场景事件数量：10000；静态表项数量：10000；源 MAC 绑定数量：10000；入口 ACL 规则数量：4096。
 * 单帧描述文件：131072 字节；`payload_hex`：最多 65535 字节。
+* `qos-schedule`：队列数量 1 到 8；全部队列帧标识合计最多 10000 项；`transmit_count` 为 0 到 10000。
 
 ## 状态
 
-功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward 四个子命令。
+功能按增量需求持续构建；当前包含 ports、config-diff、frame、forward、qos-schedule 五个子命令。
