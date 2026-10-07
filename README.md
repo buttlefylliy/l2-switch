@@ -52,8 +52,8 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 每个事件包含 `ingress_port` 与 `frame` 子命令接受的完整帧描述。
 场景可选顶层 `aging_time_ms`（1 到 9223372036854775807 的整数）启用动态
 MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 9223372036854775807 的
-整数），并按事件顺序单调不减。未提供 `aging_time_ms` 的场景不得出现
-`time_ms`。
+整数），并按事件顺序单调不减。未提供 `aging_time_ms` 且未提供
+`broadcast_storm_control` 的场景不得出现 `time_ms`。
 先校验完整场景，再按事件顺序处理：
 
 * 未标记帧归入 VLAN 1；带标签帧按 `vid` 隔离，`vid` 0 也是独立域。
@@ -271,6 +271,34 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     `effective_pcp`）之后追加 `binding_violation` 布尔值，仅冒用事件为
     `true`，其余事件（含坏帧与策略拒绝事件）均为 `false`；数组为空或省略时
     不增加该键。
+* 场景可选顶层 `broadcast_storm_control` 对象声明广播风暴抑制，仅含
+  `window_ms` 与 `port_limits` 两个字段（额外字段一律拒绝）：`window_ms`
+  为 1 到 9223372036854775807 的整数（布尔值不算整数）；`port_limits` 为
+  非空对象，把已配置物理端口名映射到 0 到 10000 的整数（布尔值不算整数），
+  表示该入口端口在一个固定窗口内允许的广播帧数；未列出的端口不受限制。
+  结构、字段、整数类型、范围或空 `port_limits` 错误在处理任何事件前以
+  ConfigError（退出码 3，路径 `$.broadcast_storm_control...`）失败；
+  `port_limits` 中的端口名未引用已配置端口时以 StateError（退出码 5，路径
+  `$.broadcast_storm_control.port_limits.<name>`）失败；失败时标准输出不
+  写入部分结果。
+  * 启用后每个事件必须携带 `time_ms`（0 到 9223372036854775807 的整数，
+    按事件顺序单调不减），与 `aging_time_ms` 共用显式事件时钟——未启用
+    老化时同样适用；省略本功能时 `time_ms` 的既有约束不变。窗口从时刻 0
+    开始，以 `time_ms` 整除 `window_ms` 的商区分，边界事件进入新窗口。
+  * 只有目的 MAC 为 `ff:ff:ff:ff:ff:ff`，且已通过帧合法性、入口端口状态、
+    VLAN 入站策略、源 MAC 绑定和入口 ACL 的事件才消耗该入口端口额度；
+    组播、未知单播及前置策略丢弃的帧不计数。限额内的候选帧沿用原有学习、
+    端口安全、查表和泛洪流程；超额候选帧固定返回 `dropped` 和空
+    `egress_ports`，不学习、刷新或迁移 MAC，不查询目的表，也不产生
+    `learned`、`refreshed` 或 `moved` 记录。显式事件时钟触发的老化仍先
+    执行并可产生 `aged` 记录；入口镜像仍可交付原始帧，出口镜像不交付被
+    抑制的帧。
+  * 提供该对象时，每条 results 记录在既有可选字段之后追加
+    `storm_controlled` 布尔值，仅因超额被丢弃的广播事件为 `true`，其余
+    事件为 `false`；省略时不增加该键，既有输出逐字节兼容。被抑制事件按
+    `include_counters` 的现有语义增加入口端口和 VLAN 的 `ingress_frames`
+    与 `dropped_frames`，不增加 `egress_frames`。每次抑制判断为常数时间，
+    附加状态不超过 `port_limits` 的端口数，不保留历史窗口。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -279,9 +307,9 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
-| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port，或镜像源/目的端口) |
+| 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或 `broadcast_storm_control.port_limits` 中的端口名) |
 
 任何错误都在处理首个事件前发现；失败时标准输出不写入任何部分结果，
 标准错误写入固定键序 `(type, message, path)` 的单行 JSON。
