@@ -4,7 +4,7 @@
 提供物理端口配置校验与确定性状态快照 (ports 子命令)、
 以太帧的离线合法性判定 (frame 子命令)，
 场景内的动态 MAC 学习、静态表项、查表与转发 (forward 子命令)，
-以及单个出口端口队列快照的严格优先级出队调度 (qos-schedule 子命令)。
+以及单个出口端口队列快照的严格优先级或加权轮询出队调度 (qos-schedule 子命令)。
 仅使用 Python 标准库，不联网，行为确定。
 """
 
@@ -2553,11 +2553,25 @@ def cmd_forward(args):
 # qos-schedule 输入的字段及其规范顺序；额外字段一律拒绝。
 # queue_count 声明单个出口端口的队列数量，queues 为按下标对齐队列号的有限
 # 队列快照，transmit_count 声明本次最多出队发送的帧数。
-QOS_SCHEDULE_FIELD_ORDER = ("queue_count", "queues", "transmit_count")
+# discipline 为可选调度策略 (strict 或 wrr，省略等同 strict)，weights 为
+# wrr 必需的逐队列权重数组；二者均为可选字段，不参与缺失检查。
+QOS_SCHEDULE_FIELD_ORDER = (
+    "queue_count",
+    "queues",
+    "transmit_count",
+    "discipline",
+    "weights",
+)
 QOS_SCHEDULE_FIELD_SET = frozenset(QOS_SCHEDULE_FIELD_ORDER)
+QOS_SCHEDULE_OPTIONAL_FIELDS = frozenset(("discipline", "weights"))
 
 MIN_SCHEDULE_QUEUE_COUNT = 1
 MAX_SCHEDULE_QUEUE_COUNT_LOCAL = MAX_SCHEDULE_QUEUES
+
+# 可选调度策略；省略 discipline 等同 strict。
+SCHEDULE_DISCIPLINES = frozenset(("strict", "wrr"))
+MIN_SCHEDULE_WEIGHT = 1
+MAX_SCHEDULE_WEIGHT = 100
 
 
 def read_schedule_input(path):
@@ -2580,13 +2594,18 @@ def read_schedule_input(path):
 
 
 def validate_schedule_input(snapshot):
-    """校验单个出口端口的队列快照，返回 (queue_count, queues, transmit_count)。
+    """校验单个出口端口的队列快照，返回 (queue_count, queues, transmit_count, discipline, weights)。
 
-    按字段在输入中出现的顺序报告未知字段，再按规范顺序报告缺失字段；
+    按字段在输入中出现的顺序报告未知字段，再按规范顺序报告缺失字段
+    (discipline 与 weights 为可选字段，不参与缺失检查)；
     queue_count 为 1..8 的整数，transmit_count 为 0..10000 的整数
     (布尔值不算整数)，queues 必须是长度等于 queue_count 的数组，每项为
     非空字符串帧标识组成的数组，同一标识不得重复，全部队列合计最多
-    10000 项。结构、字段、范围、长度或帧标识错误均为 ConfigError，
+    10000 项。discipline 只接受 strict 或 wrr，省略等同 strict；
+    选择 wrr 时必须提供 weights，weights 为长度恰好等于 queue_count 的
+    整数数组，每项对应同下标队列，取值为 1..100 (布尔值不算整数)；
+    选择 strict 或省略 discipline 时不得提供 weights。
+    结构、字段、范围、长度或帧标识错误均为 ConfigError，
     path 精确指向对应字段或数组元素。
     """
     if not isinstance(snapshot, dict):
@@ -2600,7 +2619,7 @@ def validate_schedule_input(snapshot):
         values[field] = value
 
     for field in QOS_SCHEDULE_FIELD_ORDER:
-        if field not in values:
+        if field not in values and field not in QOS_SCHEDULE_OPTIONAL_FIELDS:
             raise ConfigError(
                 "missing field '%s'" % field, "$." + field
             )
@@ -2678,38 +2697,119 @@ def validate_schedule_input(snapshot):
             transmit_path,
         )
 
-    return queue_count, checked_queues, transmit_count
+    # 可选调度策略：省略等同 strict；类型或取值错误归 ConfigError。
+    discipline = values.get("discipline", "strict")
+    if not isinstance(discipline, str) or discipline not in SCHEDULE_DISCIPLINES:
+        raise ConfigError(
+            "'discipline' must be 'strict' or 'wrr'", "$.discipline"
+        )
+
+    weights = None
+    if discipline == "wrr":
+        # wrr 必须携带逐队列权重数组。
+        if "weights" not in values:
+            raise ConfigError(
+                "'weights' is required when 'discipline' is 'wrr'",
+                "$.weights",
+            )
+        weights_value = values["weights"]
+        weights_path = "$.weights"
+        if not isinstance(weights_value, list):
+            raise ConfigError("'weights' must be an array", weights_path)
+        if len(weights_value) != queue_count:
+            raise ConfigError(
+                "'weights' must contain exactly %d elements" % queue_count,
+                weights_path,
+            )
+        weights = []
+        for index, item in enumerate(weights_value):
+            item_path = "%s[%d]" % (weights_path, index)
+            # bool 是 int 的子类型，必须显式排除。
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ConfigError(
+                    "'weights' elements must be integers", item_path
+                )
+            if item < MIN_SCHEDULE_WEIGHT or item > MAX_SCHEDULE_WEIGHT:
+                raise ConfigError(
+                    "'weights' elements must be between %d and %d"
+                    % (MIN_SCHEDULE_WEIGHT, MAX_SCHEDULE_WEIGHT),
+                    item_path,
+                )
+            weights.append(item)
+    elif "weights" in values:
+        # strict (含省略 discipline) 不得携带 weights。
+        raise ConfigError(
+            "'weights' is only valid when 'discipline' is 'wrr'",
+            "$.weights",
+        )
+
+    return queue_count, checked_queues, transmit_count, discipline, weights
 
 
-def schedule_queues(queue_count, queues, transmit_count):
-    """对单个出口端口的有限队列快照执行严格优先级调度，返回固定键序结果。
+def schedule_queues(queue_count, queues, transmit_count, discipline, weights):
+    """对单个出口端口的有限队列快照执行调度，返回固定键序结果。
 
-    较大的队列号代表更高优先级；每次从当前最高的非空队列队首取出一项，
-    同一队列保持先入先出，直到达到 transmit_count 或所有队列为空。
+    discipline 为 strict 时执行严格优先级调度：较大的队列号代表更高优先级，
+    每次从当前最高的非空队列队首取出一项，同一队列保持先入先出。
+    discipline 为 wrr 时执行确定性加权轮询：从最高队列号开始按队列号递减
+    访问，访问到零后再从最高队列开始下一轮；每次访问非空队列时最多连续
+    发送该队列权重指定数量的队首帧 (队内保持先入先出)，队列不足本次配额
+    时只发送现有帧，剩余配额不转借也不累计，空队列直接跳过。
+    两种策略都在已发送数量达到 transmit_count 或所有队列为空时停止；
+    transmit_count 大于待发送总数时只发送现有项目。
     transmitted 按发送次序记录 (sequence 从 0 连续递增)；remaining 按
     队列号升序保留全部队列 (空队列也不省略)。使用每队列队首下标避免
-    搬运帧标识，单次时间为 O(n+queue_count)，附加内存为 O(n)。
+    搬运帧标识，单次时间受总帧数与队列数线性约束，附加内存为 O(n)。
     """
     # 每队列的队首下标；调度只推进下标，不从队列中搬运帧标识。
     heads = [0] * queue_count
-    # 初始为最高队列号，逐档下降，跳过空队列。
-    highest = queue_count - 1
     transmitted = []
-    while len(transmitted) < transmit_count:
-        while highest >= 0 and heads[highest] == len(queues[highest]):
-            highest -= 1
-        if highest < 0:
-            # 所有队列为空，停止；transmit_count 大于待发送总数时只发送现有项。
-            break
-        frame_id = queues[highest][heads[highest]]
-        heads[highest] += 1
-        transmitted.append(
-            {
-                "sequence": len(transmitted),
-                "queue": highest,
-                "frame_id": frame_id,
-            }
-        )
+    if discipline == "wrr":
+        # 加权轮询：每次调用都从最高队列号开始，不保留跨调用游标。
+        non_empty = sum(1 for queue in queues if queue)
+        current = queue_count - 1
+        while len(transmitted) < transmit_count and non_empty > 0:
+            if heads[current] < len(queues[current]):
+                # 本次访问最多连续发送权重指定数量的队首帧。
+                quota = weights[current]
+                while (
+                    quota > 0
+                    and heads[current] < len(queues[current])
+                    and len(transmitted) < transmit_count
+                ):
+                    transmitted.append(
+                        {
+                            "sequence": len(transmitted),
+                            "queue": current,
+                            "frame_id": queues[current][heads[current]],
+                        }
+                    )
+                    heads[current] += 1
+                    quota -= 1
+                if heads[current] == len(queues[current]):
+                    non_empty -= 1
+            # 按队列号递减访问，访问到零后从最高队列开始下一轮。
+            current -= 1
+            if current < 0:
+                current = queue_count - 1
+    else:
+        # 严格优先级：初始为最高队列号，逐档下降，跳过空队列。
+        highest = queue_count - 1
+        while len(transmitted) < transmit_count:
+            while highest >= 0 and heads[highest] == len(queues[highest]):
+                highest -= 1
+            if highest < 0:
+                # 所有队列为空，停止；transmit_count 大于待发送总数时只发送现有项。
+                break
+            frame_id = queues[highest][heads[highest]]
+            heads[highest] += 1
+            transmitted.append(
+                {
+                    "sequence": len(transmitted),
+                    "queue": highest,
+                    "frame_id": frame_id,
+                }
+            )
 
     remaining = [
         {"queue": queue_index, "frame_ids": queues[queue_index][heads[queue_index]:]}
@@ -2731,12 +2831,20 @@ def cmd_qos_schedule(args):
         return 2
 
     try:
-        queue_count, queues, transmit_count = validate_schedule_input(snapshot)
+        (
+            queue_count,
+            queues,
+            transmit_count,
+            discipline,
+            weights,
+        ) = validate_schedule_input(snapshot)
     except ConfigError as exc:
         emit_error("ConfigError", exc.message, exc.path)
         return 3
 
-    result = schedule_queues(queue_count, queues, transmit_count)
+    result = schedule_queues(
+        queue_count, queues, transmit_count, discipline, weights
+    )
     sys.stdout.buffer.write(
         (json.dumps(result, ensure_ascii=False) + "\n").encode("utf-8")
     )
@@ -2999,23 +3107,30 @@ def build_parser():
 
     qos_schedule_parser = subparsers.add_parser(
         "qos-schedule",
-        help="对单个出口端口的有限队列快照执行严格优先级调度",
+        help="对单个出口端口的有限队列快照执行严格优先级或加权轮询调度",
         description=(
-            "通过 --input 读取 UTF-8 JSON 队列快照 (顶层仅含 queue_count、"
-            "queues 与 transmit_count)，对单个出口端口执行严格优先级调度："
-            "较大的队列号代表更高优先级，每次从当前最高的非空队列队首取出"
-            "一项，同一队列保持先入先出，直到达到 transmit_count 或所有队列"
-            "为空，并向标准输出写入单行固定键序 JSON。"
+            "通过 --input 读取 UTF-8 JSON 队列快照 (顶层含 queue_count、"
+            "queues 与 transmit_count，可选 discipline 与 weights)，对单个"
+            "出口端口执行出队调度，并向标准输出写入单行固定键序 JSON。"
+            "discipline 只接受 strict 或 wrr，省略等同 strict：strict 为"
+            "严格优先级调度，较大的队列号代表更高优先级，每次从当前最高的"
+            "非空队列队首取出一项；wrr 为确定性加权轮询，从最高队列号开始"
+            "按队列号递减访问，每次访问非空队列时最多连续发送该队列权重"
+            "指定数量的队首帧，空队列直接跳过。选择 wrr 时必须提供 "
+            "weights (长度等于 queue_count、每项为 1..100 的整数数组)；"
+            "选择 strict 或省略 discipline 时不得提供 weights。同一队列"
+            "保持先入先出，直到达到 transmit_count 或所有队列为空。"
         ),
         epilog=(
             "限制: queue_count 为 1..%d；transmit_count 为 0..%d；"
-            "全部队列合计最多 %d 项。"
+            "全部队列合计最多 %d 项；weights 每项为 1..%d 的整数。"
             "transmit_count 大于待发送总数时只发送现有项目；"
-            "相同输入的输出逐字节一致，单次时间为 O(n+queue_count)。"
+            "相同输入的输出逐字节一致，单次时间受总帧数与队列数线性约束。"
             % (
                 MAX_SCHEDULE_QUEUES,
                 MAX_SCHEDULE_TRANSMIT,
                 MAX_SCHEDULE_TOTAL_FRAMES,
+                MAX_SCHEDULE_WEIGHT,
             )
         ),
     )
@@ -3024,10 +3139,12 @@ def build_parser():
         required=True,
         metavar="FILE",
         help=(
-            "UTF-8 JSON 队列快照文件路径，顶层仅包含 queue_count (1..8 的"
+            "UTF-8 JSON 队列快照文件路径，顶层包含 queue_count (1..8 的"
             "整数)、queues (长度等于 queue_count 的数组，每项为非空字符串帧"
             "标识组成的数组，同一标识不得重复) 与 transmit_count "
-            "(0..10000 的整数)"
+            "(0..10000 的整数)，可选 discipline (strict 或 wrr，省略等同 "
+            "strict) 与 weights (wrr 必需的逐队列权重数组，每项为 1..100 "
+            "的整数)"
         ),
     )
     qos_schedule_parser.set_defaults(func=cmd_qos_schedule)
