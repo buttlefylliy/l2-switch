@@ -33,6 +33,9 @@ UNTAGGED_VID = 1
 # 二者互斥，缺省时都不出现在快照中。
 # trunk_pvid 为可选的中继本征 VLAN，只能与 trunk_vids 同时出现且必须属于
 # 该允许数组，缺省时不出现在快照中。
+# hybrid_vids、hybrid_pvid 与 hybrid_untagged_vids 共同声明可选的混合
+# VLAN 端口：三者必须同时出现，与 access_vid、trunk_vids、trunk_pvid
+# 互斥，缺省时都不出现在快照中。
 # dynamic_mac_limit 为可选的端口动态 MAC 学习数量上限 (端口安全)，
 # 缺省时不出现在快照中且保持无限制语义。
 FIELD_ORDER = (
@@ -46,11 +49,22 @@ FIELD_ORDER = (
     "access_vid",
     "trunk_vids",
     "trunk_pvid",
+    "hybrid_vids",
+    "hybrid_pvid",
+    "hybrid_untagged_vids",
     "dynamic_mac_limit",
 )
 FIELD_SET = frozenset(FIELD_ORDER)
 OPTIONAL_FIELDS = frozenset(
-    ("access_vid", "trunk_vids", "trunk_pvid", "dynamic_mac_limit")
+    (
+        "access_vid",
+        "trunk_vids",
+        "trunk_pvid",
+        "hybrid_vids",
+        "hybrid_pvid",
+        "hybrid_untagged_vids",
+        "dynamic_mac_limit",
+    )
 )
 
 MIN_ACCESS_VID = 1
@@ -61,6 +75,12 @@ MAX_TRUNK_VID = 4094
 
 MIN_TRUNK_PVID = 1
 MAX_TRUNK_PVID = 4094
+
+MIN_HYBRID_VID = 1
+MAX_HYBRID_VID = 4094
+
+MIN_HYBRID_PVID = 1
+MAX_HYBRID_PVID = 4094
 
 MIN_DYNAMIC_MAC_LIMIT = 1
 MAX_DYNAMIC_MAC_LIMIT = 10000
@@ -256,6 +276,76 @@ def _check_trunk_pvid(value, path):
     return value
 
 
+def _check_hybrid_vids(value, path):
+    # 非空不重复整数数组声明混合端口允许承载的 802.1Q VLAN；快照按数值升序规范化。
+    if not isinstance(value, list):
+        raise ConfigError("'hybrid_vids' must be an array", path)
+    if len(value) == 0:
+        raise ConfigError("'hybrid_vids' must be a non-empty array", path)
+    seen = set()
+    for index, item in enumerate(value):
+        item_path = "%s[%d]" % (path, index)
+        # bool 是 int 的子类型，必须显式排除。
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(
+                "'hybrid_vids' elements must be integers", item_path
+            )
+        if item < MIN_HYBRID_VID or item > MAX_HYBRID_VID:
+            raise ConfigError(
+                "'hybrid_vids' elements must be between %d and %d"
+                % (MIN_HYBRID_VID, MAX_HYBRID_VID),
+                item_path,
+            )
+        if item in seen:
+            raise ConfigError(
+                "'hybrid_vids' must not contain duplicate values", item_path
+            )
+        seen.add(item)
+    return sorted(value)
+
+
+def _check_hybrid_pvid(value, path):
+    # 混合端口的本征 VLAN；bool 是 int 的子类型，必须显式排除。
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'hybrid_pvid' must be an integer", path)
+    if value < MIN_HYBRID_PVID or value > MAX_HYBRID_PVID:
+        raise ConfigError(
+            "'hybrid_pvid' must be between %d and %d"
+            % (MIN_HYBRID_PVID, MAX_HYBRID_PVID),
+            path,
+        )
+    return value
+
+
+def _check_hybrid_untagged_vids(value, path):
+    # 可为空的不重复整数数组，声明混合端口出站时剥除标签的 VLAN；
+    # 必须是 hybrid_vids 的子集 (子集关系在端口级交叉检查中判定)。
+    # 快照按数值升序规范化。
+    if not isinstance(value, list):
+        raise ConfigError("'hybrid_untagged_vids' must be an array", path)
+    seen = set()
+    for index, item in enumerate(value):
+        item_path = "%s[%d]" % (path, index)
+        # bool 是 int 的子类型，必须显式排除。
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ConfigError(
+                "'hybrid_untagged_vids' elements must be integers", item_path
+            )
+        if item < MIN_HYBRID_VID or item > MAX_HYBRID_VID:
+            raise ConfigError(
+                "'hybrid_untagged_vids' elements must be between %d and %d"
+                % (MIN_HYBRID_VID, MAX_HYBRID_VID),
+                item_path,
+            )
+        if item in seen:
+            raise ConfigError(
+                "'hybrid_untagged_vids' must not contain duplicate values",
+                item_path,
+            )
+        seen.add(item)
+    return sorted(value)
+
+
 def _check_dynamic_mac_limit(value, path):
     # 可选的端口动态 MAC 学习数量上限；bool 是 int 的子类型，必须显式排除。
     if isinstance(value, bool) or not isinstance(value, int):
@@ -280,6 +370,9 @@ FIELD_CHECKS = {
     "access_vid": _check_access_vid,
     "trunk_vids": _check_trunk_vids,
     "trunk_pvid": _check_trunk_pvid,
+    "hybrid_vids": _check_hybrid_vids,
+    "hybrid_pvid": _check_hybrid_pvid,
+    "hybrid_untagged_vids": _check_hybrid_untagged_vids,
     "dynamic_mac_limit": _check_dynamic_mac_limit,
 }
 
@@ -291,6 +384,10 @@ def validate_port(item, index, seen):
     报告)；仅当所有出现字段均合法后，才检查 access_vid 与 trunk_vids 互斥，
     再检查 trunk_pvid 与 trunk_vids 的搭配关系 (trunk_pvid 只能在
     trunk_vids 配置时出现且必须属于该允许数组)，
+    再检查混合端口字段：hybrid_vids、hybrid_pvid 与 hybrid_untagged_vids
+    与 access_vid、trunk_vids、trunk_pvid 互斥，三者必须同时出现，
+    hybrid_pvid 必须属于 hybrid_vids，hybrid_untagged_vids 必须是
+    hybrid_vids 的子集，
     再按规范字段顺序报告首个缺失字段 (可选字段不参与缺失检查)。
     """
     base = "$.ports[%d]" % index
@@ -332,6 +429,49 @@ def validate_port(item, index, seen):
                 "'trunk_pvid' must be one of 'trunk_vids'",
                 base + ".trunk_pvid",
             )
+
+    hybrid_present = any(
+        field in values
+        for field in ("hybrid_vids", "hybrid_pvid", "hybrid_untagged_vids")
+    )
+    if hybrid_present:
+        # 混合 VLAN 端口与接入/中继模式互斥；三个 hybrid 字段必须同时出现，
+        # hybrid_pvid 必须属于 hybrid_vids，hybrid_untagged_vids 必须是
+        # hybrid_vids 的子集。
+        if "access_vid" in values:
+            raise ConfigError(
+                "'hybrid_vids' and 'access_vid' are mutually exclusive",
+                base + ".hybrid_vids",
+            )
+        if "trunk_vids" in values:
+            raise ConfigError(
+                "'hybrid_vids' and 'trunk_vids' are mutually exclusive",
+                base + ".hybrid_vids",
+            )
+        if "trunk_pvid" in values:
+            raise ConfigError(
+                "'hybrid_vids' and 'trunk_pvid' are mutually exclusive",
+                base + ".hybrid_vids",
+            )
+        for field in ("hybrid_vids", "hybrid_pvid", "hybrid_untagged_vids"):
+            if field not in values:
+                raise ConfigError(
+                    "'hybrid_vids', 'hybrid_pvid' and 'hybrid_untagged_vids'"
+                    " must appear together",
+                    base + "." + field,
+                )
+        if values["hybrid_pvid"] not in values["hybrid_vids"]:
+            raise ConfigError(
+                "'hybrid_pvid' must be one of 'hybrid_vids'",
+                base + ".hybrid_pvid",
+            )
+        hybrid_vid_set = frozenset(values["hybrid_vids"])
+        for item in values["hybrid_untagged_vids"]:
+            if item not in hybrid_vid_set:
+                raise ConfigError(
+                    "'hybrid_untagged_vids' must be a subset of 'hybrid_vids'",
+                    base + ".hybrid_untagged_vids",
+                )
 
     for field in FIELD_ORDER:
         if field not in values and field not in OPTIONAL_FIELDS:
@@ -1198,7 +1338,8 @@ def validate_scenario(scenario):
     storm_control, multicast_storm_control, unknown_unicast_storm_control)：
     port_by_name 将端口 name 映射为
     {"can_forward", "can_learn", "access_vid", "trunk_vids",
-    "trunk_pvid", "dynamic_mac_limit"} (未配置对应 VLAN 模式、本征 VLAN
+    "trunk_pvid", "hybrid_vids", "hybrid_pvid", "hybrid_untagged_vids",
+    "dynamic_mac_limit"} (未配置对应 VLAN 模式、本征 VLAN
     或学习上限时为 None)；
     validated_events 每项为 (ingress_name, 帧判定结果, time_ms)，
     未启用老化时 aging_time_ms 与每项 time_ms 均为 None；
@@ -1311,6 +1452,14 @@ def validate_scenario(scenario):
             # 未配置 trunk_pvid 时为 None，表示中继端口不接收未标记帧；
             # 配置时为未标记入站帧归属的本征 VLAN (保证属于 trunk_vids)。
             "trunk_pvid": fields.get("trunk_pvid"),
+            # 未配置混合 VLAN 模式时三者均为 None；配置时 hybrid_vids 与
+            # hybrid_untagged_vids 为按数值升序规范化后的数组，
+            # hybrid_pvid 为未标记入站帧归属的本征 VLAN (保证属于
+            # hybrid_vids)，hybrid_untagged_vids 为出站剥除标签的 VLAN
+            # 子集 (保证是 hybrid_vids 的子集)。
+            "hybrid_vids": fields.get("hybrid_vids"),
+            "hybrid_pvid": fields.get("hybrid_pvid"),
+            "hybrid_untagged_vids": fields.get("hybrid_untagged_vids"),
             # 未配置 dynamic_mac_limit 时为 None，表示动态学习数量无限制。
             "dynamic_mac_limit": fields.get("dynamic_mac_limit"),
         }
@@ -1538,14 +1687,24 @@ def run_scenario(scenario):
 
     def vlan_allows(port_name, vid):
         # 接入口只承载与其 access_vid 相同的内部 VLAN；中继端口只承载
-        # trunk_vids 允许的内部 VLAN；两种 VLAN 模式都未配置的端口不受
-        # 接入/中继 VLAN 限制，按既有语义参与转发。
+        # trunk_vids 允许的内部 VLAN；混合端口只承载 hybrid_vids 允许的
+        # 内部 VLAN；三种 VLAN 模式都未配置的端口不受接入/中继/混合 VLAN
+        # 限制，按既有语义参与转发。
         attrs = port_by_name[port_name]
         access_vid = attrs["access_vid"]
         if access_vid is not None:
             return access_vid == vid
         trunk_vids = attrs["trunk_vids"]
-        return trunk_vids is None or vid in trunk_vids
+        if trunk_vids is not None:
+            return vid in trunk_vids
+        hybrid_vids = attrs["hybrid_vids"]
+        return hybrid_vids is None or vid in hybrid_vids
+
+    # 场景含混合端口时，每条结果记录在 egress_ports 后追加
+    # hybrid_egress_actions；未配置任何混合端口时输出与此前逐字节一致。
+    hybrid_enabled = any(
+        attrs["hybrid_vids"] is not None for attrs in port_by_name.values()
+    )
 
     for index, (ingress, verdict, time_ms) in enumerate(events):
         # 老化由显式事件时钟驱动：在处理该帧之前，一次性删除所有
@@ -1582,6 +1741,8 @@ def run_scenario(scenario):
         access_vid = ingress_attrs["access_vid"]
         trunk_vids = ingress_attrs["trunk_vids"]
         trunk_pvid = ingress_attrs["trunk_pvid"]
+        hybrid_vids = ingress_attrs["hybrid_vids"]
+        hybrid_pvid = ingress_attrs["hybrid_pvid"]
         tagged = verdict["vlan"] is not None
         if tagged:
             # 带标签帧的内部 VLAN 取其标签 VID；在接入口上这也是违例事件的
@@ -1593,6 +1754,9 @@ def run_scenario(scenario):
         elif trunk_pvid is not None:
             # 配置了本征 VLAN 的中继端口上的未标记帧 (含坏帧) 归入该 PVID。
             vid = trunk_pvid
+        elif hybrid_pvid is not None:
+            # 混合端口上的未标记帧 (含坏帧) 归入其 PVID。
+            vid = hybrid_pvid
         else:
             # 其他端口上的未标记帧 (含坏帧) 归入缺省 VLAN 1。
             vid = UNTAGGED_VID
@@ -1608,6 +1772,9 @@ def run_scenario(scenario):
         # trunk_vids 允许数组中：中继策略违例，dropped，不学习、不查表、
         # 无出口。配置了 trunk_pvid 时未标记帧归入该 PVID (保证属于
         # trunk_vids)，按合法候选继续既有流程。
+        # 混合端口收到标签 VID 为 0 或不在 hybrid_vids 允许数组中的带标签帧：
+        # VLAN 策略违例，dropped，不学习、不查表、无出口；未标记帧归入
+        # hybrid_pvid (保证属于 hybrid_vids)，按合法候选继续既有流程。
         # 未通过上述检查的事件不进入 ACL 求值，matched_acl_rule 为 null。
         pre_acl_ok = not (
             not verdict["valid"]
@@ -1617,6 +1784,7 @@ def run_scenario(scenario):
                 trunk_vids is not None
                 and ((not tagged and trunk_pvid is None) or vid not in trunk_vids)
             )
+            or (hybrid_vids is not None and tagged and vid not in hybrid_vids)
         )
 
         # 源 MAC 静态绑定在入口 ACL、端口安全、MAC 学习与目的查表前查询一次：
@@ -1911,6 +2079,40 @@ def run_scenario(scenario):
             "decision": decision,
             "egress_ports": egress,
         }
+        if hybrid_enabled:
+            # hybrid_egress_actions 紧随 egress_ports：按 egress_ports 顺序
+            # 只记录实际混合出口；出站 VLAN 属于 hybrid_untagged_vids 时剥除
+            # 标签 (vlan 为 null)，否则携带该 VID 标签——原帧带标签时保留
+            # ACL 处理后的 PCP 与原 DEI，未标记帧需要加标签时二者均为 0。
+            # 没有混合出口时为空数组。
+            hybrid_actions = []
+            for name in egress:
+                egress_attrs = port_by_name[name]
+                if egress_attrs["hybrid_vids"] is None:
+                    continue
+                if vid in egress_attrs["hybrid_untagged_vids"]:
+                    hybrid_actions.append(
+                        {"port": name, "tagged": False, "vlan": None}
+                    )
+                else:
+                    if tagged:
+                        action_pcp = effective_pcp
+                        action_dei = verdict["vlan"]["dei"]
+                    else:
+                        action_pcp = 0
+                        action_dei = 0
+                    hybrid_actions.append(
+                        {
+                            "port": name,
+                            "tagged": True,
+                            "vlan": {
+                                "vid": vid,
+                                "pcp": action_pcp,
+                                "dei": action_dei,
+                            },
+                        }
+                    )
+            result_record["hybrid_egress_actions"] = hybrid_actions
         if mirror_enabled:
             # mirror_ports 紧随 egress_ports 之后。
             result_record["mirror_ports"] = mirror_ports
@@ -2127,6 +2329,16 @@ def build_parser():
             "此 PVID 并继续既有的学习、查表、泛洪、ACL、绑定、端口安全、审计"
             "与计数流程；未配置 trunk_pvid 的中继端口仍将未标记帧作为中继"
             "策略违例丢弃。"
+            "端口可选 hybrid_vids、hybrid_pvid 与 hybrid_untagged_vids"
+            " (三者必须同时出现，与 access_vid、trunk_vids、trunk_pvid"
+            " 互斥) 声明混合 VLAN 端口：hybrid_vids 为 1..4094 的非空不重复"
+            "整数数组，hybrid_pvid 必须属于该数组，hybrid_untagged_vids 为"
+            "其不重复子集且可为空；该端口上的未标记帧归入 hybrid_pvid，"
+            "带标签帧仅 VID 属于 hybrid_vids 时接受，VID 0 或不允许的标签帧"
+            "作为 VLAN 策略违例丢弃；只有内部 VLAN 被允许的混合端口才能成为"
+            "出口，出站 VLAN 属于 hybrid_untagged_vids 时剥除标签，否则携带"
+            "该 VID 标签。场景含混合端口时，每条 results 记录在 egress_ports"
+            " 后追加 hybrid_egress_actions。"
             "端口可选 dynamic_mac_limit (1..10000 的整数) 限制绑定到该端口的"
             "动态 MAC 学习数量 (不区分 VLAN，静态项不占额度)：合法帧首次学习或"
             "跨端口迁入而额度已满时该事件 dropped、无出口且不改变动态表，"

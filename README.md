@@ -41,6 +41,17 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 `trunk_vids`，或取值不在允许数组中时，以 ConfigError（退出码 3，路径
 `$.ports[i].trunk_pvid`）失败。
 
+每个端口可选 `hybrid_vids`、`hybrid_pvid` 与 `hybrid_untagged_vids`
+三个字段共同声明混合 VLAN 端口：`hybrid_vids` 为 1 到 4094 的整数组成
+的非空数组（布尔值不算整数，数组内不得重复），`hybrid_pvid` 为 1 到
+4094 的整数且必须属于 `hybrid_vids`，`hybrid_untagged_vids` 为
+`hybrid_vids` 的不重复子集且可为空数组；三者必须同时出现，并与
+`access_vid`、`trunk_vids`、`trunk_pvid` 互斥。提供时快照中三个字段按
+上述顺序位于 `duplex` 之后、`dynamic_mac_limit` 之前，两个数组规范化为
+数值升序；省略时不补默认键，既有快照的键序与逐字节内容不变。类型、
+范围、重复值、包含关系、成组出现或模式冲突错误以 ConfigError（退出码
+3，路径 `$.ports[i].hybrid_vids` 等对应端口字段）失败。
+
 每个端口可选 `dynamic_mac_limit` 字段（1 到 10000 的整数，布尔值不算
 整数）声明该端口动态 MAC 学习数量上限，模拟最基本的端口安全；省略时
 不补默认键并保持无限制语义，不改变 `can_forward`/`can_learn` 的推导。
@@ -91,6 +102,22 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   VLAN 计数与 FDB 键都使用这个内部 VLAN。`trunk_pvid` 只补充入站归属，
   不改变出口选择（仍按 `trunk_vids` 成员关系执行），也不新增出口标签
   明细。
+* 配置了 `hybrid_vids`/`hybrid_pvid`/`hybrid_untagged_vids` 的端口为
+  混合端口：其上的未标记帧（含坏帧的结果 vid 与 VLAN 入站计数）归入
+  `hybrid_pvid`；带标签帧仅在 VID 属于 `hybrid_vids` 时接受，VID 0 或
+  未允许 VID 作为 VLAN 策略违例 `dropped`，不学习、不查表、无出口。
+  合法帧沿用既有的合法性判定、学习与老化、静态表、ACL、源 MAC 绑定、
+  端口学习上限、风暴抑制、镜像、审计与计数流程（ACL 的 `vid` 匹配与
+  绑定查询使用内部 VLAN，混合端口未标记帧即 `hybrid_pvid`）。混合端口
+  仅在内部 VLAN 属于 `hybrid_vids` 时成为单播或泛洪出口；动态或静态
+  单播命中一个不允许该 VLAN 的混合端口时结果为 `dropped`，不退回泛洪。
+  出站 VLAN 属于 `hybrid_untagged_vids` 时剥除标签，否则携带该 VID
+  标签——原帧带标签时保留 ACL 处理后的 PCP 与原 DEI，未标记帧需要加
+  标签时 PCP 与 DEI 均为 0。场景含混合端口时，每条 results 记录在
+  `egress_ports` 后追加 `hybrid_egress_actions`，按 `egress_ports`
+  顺序仅记录实际混合出口，每项固定含 `port`、`tagged`、`vlan`：剥标签
+  时 `vlan` 为 null，带标签时为含 `vid`、`pcp`、`dei` 的对象，没有混合
+  出口时为空数组；未配置混合字段的场景输出与此前逐字节一致。
 * 仅合法、未被丢弃且入端口 `can_learn` 为真的帧，按 (VLAN, 规范化小写单播源 MAC)
   学习；同一键从另一端口出现时迁移到新端口。
 * 端口配置了 `dynamic_mac_limit` 时启用最基本的端口安全：上限按当前绑定到
