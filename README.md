@@ -442,6 +442,31 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
     未知单播事件为 `true`，其余为 `false`；省略时不增加该键，既有输出
     逐字节兼容。每次抑制判断为常数时间，附加状态不超过 `port_limits`
     的端口数，且不保留历史窗口。
+* 场景可选顶层 `qos_queues` 对象声明出口队列分类，仅含 `queue_count`、
+  `pcp_to_queue` 与 `untagged_queue` 三个字段（额外字段一律拒绝）：
+  `queue_count` 为 1 到 8 的整数（布尔值不算整数）；`pcp_to_queue` 为
+  恰好八个整数组成的数组，下标表示 PCP 0 到 7，数组值须落在 0 到
+  `queue_count-1`；`untagged_queue` 为 0 到 `queue_count-1` 的整数
+  （布尔值不算整数）。本次只做确定性的队列分类与审计，不引入缓存深度、
+  丢弃算法或出队调度。`qos_queues` 不是对象、字段缺失或多余、
+  `queue_count` 越界、`pcp_to_queue` 类型或长度错误、任一队列号类型或
+  范围非法时，都在处理任何事件前以 ConfigError（退出码 3，路径
+  `$.qos_queues...`，精确指向对应字段或数组元素）失败，标准输出不写入
+  部分结果。
+  * 完整场景校验成功后，每个事件仍沿用现有合法性、VLAN 入站、源绑定、
+    入口 ACL、学习、查表与出口选择流程；启用 `qos_queues` 不改变转发
+    决定、`egress_ports`、镜像、计数、FDB 状态及审计记录。
+  * 对最终 `egress_ports` 中的每个普通出口，带 802.1Q 标签的帧用
+    `effective_pcp`（体现入口 ACL 重标记后的值）查询 `pcp_to_queue`，
+    未标记帧使用 `untagged_queue`。入口和出口镜像副本不参与分类；混合
+    端口出站剥除标签也不改变已按内部帧优先级得到的分类。
+  * 启用配置时，每条 results 记录在所有现有可选字段之后追加
+    `egress_queues` 数组，每项按固定键序包含 `port` 和 `queue`，与
+    `egress_ports` 同序且一一对应；`dropped`、`filtered` 或无出口事件
+    返回空数组。省略 `qos_queues` 时，ports、config-diff、frame 和
+    forward 的校验、键序、退出码及逐字节输出保持不变。
+  * 每个事件的新增时间与实际出口数线性相关，除结果数组外不保留跨事件
+    队列状态。
 * 只做场景内转发表；无端口模式或跨进程持久化。
 
 ## 退出码与错误
@@ -450,7 +475,7 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
 | --- | --- | --- |
 | 0 | — | 成功，标准输出为单行 JSON |
 | 2 | InputError | 文件读取、UTF-8 解码或 JSON 解析错误 |
-| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control` 的结构、字段、类型或取值错误 |
+| 3 | ConfigError | 端口配置或 `aging_time_ms`、`include_counters`、`include_fdb_events`、`static_table`、`mac_bindings`、`ingress_mirror`、`egress_mirror`、`ingress_acl`、`broadcast_storm_control`、`multicast_storm_control`、`unknown_unicast_storm_control`、`qos_queues` 的结构、字段、类型或取值错误 |
 | 4 | FrameError | 事件或帧的结构、字段、类型、范围或格式错误 |
 | 5 | StateError | 引用了未配置的物理端口 (未知 ingress_port、静态项或绑定项 port、镜像源/目的端口，或风暴抑制 port_limits 端口) |
 
