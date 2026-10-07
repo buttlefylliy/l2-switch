@@ -41,6 +41,22 @@ VLAN 归属，不改变由管理状态、转发状态和 `learning` 推导出的
 `trunk_vids`，或取值不在允许数组中时，以 ConfigError（退出码 3，路径
 `$.ports[i].trunk_pvid`）失败。
 
+每个端口可选 `hybrid_vids`、`hybrid_pvid` 与 `hybrid_untagged_vids` 三个
+字段共同声明混合 VLAN 端口，三者必须同时出现，且与 `access_vid`、
+`trunk_vids`、`trunk_pvid` 互斥：`hybrid_vids` 为 1 到 4094 的整数组成的
+非空、不重复数组（布尔值不算整数），声明允许承载的 802.1Q VLAN；
+`hybrid_pvid` 为 1 到 4094 的整数且必须属于 `hybrid_vids`，声明本征
+VLAN；`hybrid_untagged_vids` 为 `hybrid_vids` 的不重复子集（可为空
+数组），声明出站剥除标签的 VLAN。提供时快照中三字段按上述顺序位于
+`duplex` 之后（`access_vid`/`trunk_vids`/`trunk_pvid` 因互斥不会同时
+出现）、`dynamic_mac_limit` 之前，两个数组规范化为数值升序，
+`hybrid_pvid` 原样保留；三者都省略时不补默认键，既有快照的键序与逐字节
+内容不变。类型、范围、重复值、包含关系（`hybrid_pvid` 不属于
+`hybrid_vids`、`hybrid_untagged_vids` 不是其子集）、三者未同时出现或与
+接入/中继字段冲突时，以 ConfigError（退出码 3，路径
+`$.ports[i].hybrid_vids`/`$.ports[i].hybrid_pvid`/
+`$.ports[i].hybrid_untagged_vids` 或对应元素路径）失败。
+
 每个端口可选 `dynamic_mac_limit` 字段（1 到 10000 的整数，布尔值不算
 整数）声明该端口动态 MAC 学习数量上限，模拟最基本的端口安全；省略时
 不补默认键并保持无限制语义，不改变 `can_forward`/`can_learn` 的推导。
@@ -91,6 +107,23 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   VLAN 计数与 FDB 键都使用这个内部 VLAN。`trunk_pvid` 只补充入站归属，
   不改变出口选择（仍按 `trunk_vids` 成员关系执行），也不新增出口标签
   明细。
+* 配置 `hybrid_vids`/`hybrid_pvid`/`hybrid_untagged_vids` 的端口为混合
+  端口：其上的未标记帧（含坏帧的结果 vid 与 VLAN 入站计数）归入
+  `hybrid_pvid`；带标签帧仅当 VID 属于 `hybrid_vids` 时接受，VID 0 或
+  未允许 VID 作为混合策略违例 `dropped`，不学习、不查表、无出口。合法
+  帧沿用既有的合法性判定、学习与老化、静态表、ACL、源 MAC 绑定、端口
+  学习上限、风暴抑制、审计与计数流程，结果中的 vid、VLAN 计数与 FDB 键
+  都使用这个内部 VLAN。混合端口仅在内部 VLAN 属于其 `hybrid_vids` 时
+  才能成为单播或泛洪出口；命中不允许该 VLAN 的混合端口时结果为
+  `dropped`，不退回泛洪。出站 VLAN 属于 `hybrid_untagged_vids` 时剥除
+  标签，否则携带该 VID 标签：原帧带标签时保留 ACL 处理后的 PCP 与原
+  DEI，未标记帧需要加标签时 PCP 与 DEI 均为 0。场景含任一混合端口时，
+  每条 results 记录在 `egress_ports` 之后追加 `hybrid_egress_actions`：
+  按 `egress_ports` 顺序仅记录实际混合出口，每项固定含 `port`、
+  `tagged`、`vlan`——剥除标签时 `tagged` 为 false 且 `vlan` 为 null，
+  携带标签时 `tagged` 为 true 且 `vlan` 为含 `vid`、`pcp`、`dei` 的
+  对象；没有混合出口时为空数组。未配置混合字段时 ports 与 forward 的
+  校验、输出键序及逐字节结果保持不变。
 * 仅合法、未被丢弃且入端口 `can_learn` 为真的帧，按 (VLAN, 规范化小写单播源 MAC)
   学习；同一键从另一端口出现时迁移到新端口。
 * 端口配置了 `dynamic_mac_limit` 时启用最基本的端口安全：上限按当前绑定到
@@ -114,10 +147,11 @@ MAC 老化；启用后每个事件必须包含 `time_ms`（0 到 922337203685477
   时间仍触发到期清理，但不新建或刷新表项。刷新时间取学习/迁移事件的
   `time_ms`；不同 VLAN 的同名 MAC 独立老化。处理不按时间跨度循环推进。
 * 输出为单行固定键序 JSON：版本标识、与输入一一对应的结果
-  (event、vid、src_mac、dst_mac、decision、egress_ports；提供
-  `ingress_mirror` 时在 egress_ports 后追加 mirror_ports；提供
+  (event、vid、src_mac、dst_mac、decision、egress_ports；场景含混合
+  端口时在 egress_ports 后追加 hybrid_egress_actions；提供
+  `ingress_mirror` 时再追加 mirror_ports；提供
   `egress_mirror` 时再追加 egress_mirror_ports，未启用入口镜像时该键紧随
-  egress_ports) 以及最终动态表快照
+  前述字段) 以及最终动态表快照
   (按 VLAN 数值升序、再按 MAC 的 Unicode 码点升序；仅含最后事件时刻仍有效
   的表项)。
 * 场景可选顶层 `include_counters`（布尔）：为 true 时在 `dynamic_table` 后
